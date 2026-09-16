@@ -12,8 +12,9 @@ import { buildFollowUpCard, buildRootCard, topicKey } from "./forward.js";
 import { History } from "./history.js";
 import { loadKnowledgeBase } from "./kb.js";
 import { Limits } from "./limits.js";
-import { prepareImageUrls, quotedImageUrls, resizeImageBuffer } from "./media.js";
-import { buildUserText, ensureQuotaNotice, imageNotes, splitReply } from "./qq.js";
+import { buildMessages } from "./llm.js";
+import { clearPreparedImageCache, prepareImages, prepareImageUrls, quotedImageUrls, resizeImageBuffer } from "./media.js";
+import { buildUserText, createSerialQueue, ensureQuotaNotice, platformBackground, splitReply } from "./qq.js";
 import { FILE_PATTERNS, dayKey, migrateLegacyForwards, monthKey, pruneByAge, stampKey } from "./retention.js";
 import { stripMentions, truncateText } from "./text.js";
 import { extractTextToolCalls, runTextToolCalls } from "./toolmarkup.js";
@@ -191,16 +192,17 @@ check(
 
 const userText = buildUserText({
   question: "怎么退款",
-  contextText: "=== 消息 1 ===\n[消息内容] 我要退款旺仔牛奶",
   senderName: "小明",
   skippedImages: 1,
 });
 check(
   "用户消息组装",
-  userText.includes("问题：怎么退款") &&
-    userText.includes("[对话上下文]") &&
-    userText.includes("我要退款旺仔牛奶") &&
-    userText.includes("小明"),
+  userText.includes("问题：怎么退款") && userText.includes("小明") && userText.includes("【必须告知】"),
+);
+
+check(
+  "平台背景：整段附在问题后面，并写明它是背景不是新问题",
+  platformBackground("=== 消息 1 ===\n[消息内容] 已经转交给人工了").includes("不是这次要处理的新问题"),
 );
 
 const quotaText = buildUserText({
@@ -401,7 +403,7 @@ imgLimiter.consumeImages("U1", 999);
 check("读图额度：不会变成负数", imgLimiter.imageBudget("U1") === 0);
 await imgLimiter.flush();
 
-// 9. 本地对话缓冲（6 小时窗口）
+// 9. 本地对话缓冲（渲染成多轮 messages）
 const historyCfg = {
   ...cfg,
   DATA_DIR: "data/smoke-tmp/history",
@@ -411,43 +413,79 @@ const historyCfg = {
   HISTORY_MAX_ENTRIES: 10,
   HISTORY_MAX_STORED: 50,
   IMG_CONTEXT_MAX_COUNT: 5,
-  IMG_CONTEXT_MAX_AGE_MINUTES: 30,
   CONTEXT_MESSAGE_MAX_CHARS: 600,
   CONTEXT_MAX_CHARS: 3000,
 } as unknown as Config;
 
 const history = new History(historyCfg);
 await history.init();
-check("缓冲：空群渲染为空", history.render("G1") === "");
+const textOf = (group: string, speakerId?: string): string =>
+  history
+    .render(group, speakerId === undefined ? {} : { speakerId })
+    .turns.map((t) => t.text)
+    .join("\n");
+check("缓冲：空群渲染为空", history.render("G1").turns.length === 0);
 
 history.record("G1", { at: Date.now() - 5 * 60_000, role: "user", senderName: "Heuluck", content: "我手机号换了咋办" });
 history.record("G1", { at: Date.now() - 4 * 60_000, role: "bot", content: "分两种情况喵：旧号能用就自己改，不能用就找我转人工" });
 history.record("G1", { at: Date.now() - 60_000, role: "user", senderName: "Heuluck", content: "没用了" });
 const rendered = history.render("G1");
 check(
-  "缓冲：包含用户与机器人双方记录",
-  rendered.includes("用户Heuluck: 我手机号换了咋办") && rendered.includes("客服: 分两种情况喵") && rendered.includes("用户Heuluck: 没用了"),
+  "缓冲：渲染成多轮，用户与机器人的记录都在",
+  rendered.turns.length === 3 &&
+    rendered.turns[0]!.role === "user" &&
+    rendered.turns[1]!.role === "bot" &&
+    rendered.turns[2]!.role === "user" &&
+    textOf("G1").includes("用户Heuluck: 我手机号换了咋办") &&
+    textOf("G1").includes("分两种情况喵"),
 );
-check("缓冲：带时间戳（东八区 HH:mm）", /\[\d{2}:\d{2}\]/.test(rendered), rendered.split("\n")[0]);
+check(
+  "缓冲：用户轮带时间戳与昵称前缀，机器人自己的轮不带前缀",
+  rendered.turns.every((t) => (t.role === "bot" ? !t.text.startsWith("[") : /^\[\d{2}:\d{2}\] 用户Heuluck: /.test(t.text))),
+  `user="${rendered.turns[0]!.text}" / bot="${rendered.turns[1]!.text}"`,
+);
 
 // 窗口：7 小时前的记录应被排除
 history.record("G2", { at: Date.now() - 7 * 60 * 60_000, role: "user", content: "很久以前的消息" });
 history.record("G2", { at: Date.now() - 60_000, role: "user", content: "刚刚的消息" });
-const windowed = history.render("G2");
-check("缓冲：6 小时窗口外的记录不注入", !windowed.includes("很久以前的消息") && windowed.includes("刚刚的消息"));
+check("缓冲：存储窗口外的记录不进入历史", !textOf("G2").includes("很久以前的消息") && textOf("G2").includes("刚刚的消息"));
 
-// 条数与字符数上限
-for (let i = 0; i < 40; i += 1) {
-  history.record("G3", { at: Date.now(), role: "user", content: `第 ${i} 条${"长".repeat(200)}` });
+// 会话窗口：闲置超过 HISTORY_INJECT_MINUTES 分钟就当开了新会话
+history.record("G9", { at: Date.now() - 90 * 60_000, role: "user", content: "一个半小时前聊过的旧话题" });
+history.record("G9", { at: Date.now() - 5 * 60_000, role: "user", content: "刚刚的问题" });
+check(
+  "缓冲：会话窗口比存储窗口紧（1.5 小时前的旧话题不带）",
+  !textOf("G9").includes("旧话题") && textOf("G9").includes("刚刚的问题"),
+);
+
+// 条数上限：超了从**头部整轮**丢，不能把「提问」和它的「回答」切开
+for (let i = 0; i < 12; i += 1) {
+  history.record("G3", { at: Date.now(), role: "user", content: `Q${i}` });
+  history.record("G3", { at: Date.now(), role: "bot", content: `A${i}` });
 }
 const capped = history.render("G3");
 check(
-  "缓冲：注入条数与字符数受上限约束",
-  capped.split("\n").length <= 10 && capped.length <= 3100,
-  `${capped.split("\n").length} 行 / ${capped.length} 字符`,
+  "缓冲：超出条数上限时从头整轮丢弃，最新一轮保留",
+  capped.turns.length === historyCfg.HISTORY_MAX_ENTRIES && capped.turns.at(-1)!.text.includes("A11"),
+  `${capped.turns.length} 轮`,
+);
+check(
+  "缓冲：丢弃后仍然「问-答」紧邻，不会留下没有前因的答复",
+  capped.turns.every((turn, i) => turn.role === "user" || (capped.turns[i - 1]?.role ?? "user") === "user"),
 );
 
-// 存储上限与注入上限分开：存 50 条，注入仍只给 10 条
+// 字符预算：同样整轮丢
+for (let i = 0; i < 10; i += 1) {
+  history.record("G5", { at: Date.now(), role: "user", content: `${"长".repeat(500)}${i}` });
+}
+const byChars = history.render("G5");
+check(
+  "缓冲：超出字符预算时整轮丢弃（不是从中间切字符串）",
+  byChars.turns.length > 0 && byChars.turns.length < 10 && byChars.turns.every((t) => !t.text.includes("已截断")),
+  `${byChars.turns.length} 轮 / ${byChars.turns.reduce((n, t) => n + t.text.length, 0)} 字符`,
+);
+
+// 存储上限与注入上限分开
 for (let i = 0; i < 80; i += 1) {
   history.record("G4", { at: Date.now(), role: "user", content: `消息 ${i}` });
 }
@@ -456,120 +494,119 @@ const stored = (JSON.parse(readFileSync("data/smoke-tmp/history/history.json", "
   "G4"
 ];
 check("缓冲：存储上限 50 条", stored !== undefined && stored.length === 50, `实际存 ${stored?.length ?? 0} 条`);
-check("缓冲：注入仍只取最近 10 条", history.render("G4").split("\n").length === 10);
+check("缓冲：注入仍受 HISTORY_MAX_ENTRIES 约束", history.render("G4").turns.length === 10);
 
 await history.flush();
 const reloaded = new History(historyCfg);
 await reloaded.init();
-check("缓冲：重启后仍能恢复近况", reloaded.render("G1").includes("没用了"));
+check("缓冲：重启后仍能恢复近况", reloaded.render("G1").turns.some((t) => t.text.includes("没用了")));
 
 const disabled = new History({ ...historyCfg, HISTORY_ENABLED: false } as unknown as Config);
 await disabled.init();
 disabled.record("G1", { at: Date.now(), role: "user", content: "不该被记录" });
-check("缓冲：开关关闭后不记录也不注入", disabled.render("G1") === "");
+check("缓冲：开关关闭后不记录也不渲染", disabled.render("G1").turns.length === 0);
 
-// 缓冲里的图片：「用户先发截图、再 @ 提问」时把图喂给模型，且只取同一个用户发的
-const urls = (group: string, sender: string, max?: number, ageMinutes?: number): string[] =>
-  history.pendingImages(group, sender, max, ageMinutes).map((item) => item.url);
-
+// 图片：挂在**它到来的那一轮**上，而不是挪到当前轮。
+// 这是实测踩过的坑的结构性修复：以前图只能作为当前消息的附件，模型会把 25 分钟前的崩溃截图
+// 当成这次的新证据，回了「看你发的截图还是会弹严重错误崩溃」并误转交一次人工。
 history.record("G6", { at: Date.now() - 60_000, role: "user", senderId: "U1", content: "（发了图片）", imageUrls: ["https://x/old.png"] });
 history.record("G6", { at: Date.now() - 45_000, role: "user", senderId: "U2", content: "（发了图片）", imageUrls: ["https://x/other.png"] });
 history.record("G6", { at: Date.now() - 30_000, role: "user", senderId: "U1", content: "发生什么了啊" });
 history.record("G6", { at: Date.now(), role: "user", senderId: "U1", content: "（发了图片）", imageUrls: ["https://x/new.png"] });
-history.record("G6", { at: Date.now(), role: "user", senderId: "U1", content: "（发了图片）", imageUrls: ["https://x/new.png"] });
+const withImages = history.render("G6", { speakerId: "U1" });
+const imageTurnIndex = withImages.turns.findIndex((t) => t.images.includes("https://x/old.png"));
 check(
-  "缓冲图片：只取同一用户发的图（别人发的排除）",
-  JSON.stringify(urls("G6", "U1", 5)) === JSON.stringify(["https://x/new.png", "https://x/old.png"]),
-  "U2 的 other.png 未出现、重复的 new.png 只出现一次",
+  "历史图片：挂在它自己那一轮上（不是最后一轮）",
+  imageTurnIndex >= 0 && imageTurnIndex < withImages.turns.length - 1,
+  `第 ${imageTurnIndex + 1} / ${withImages.turns.length} 轮`,
 );
-check("缓冲图片：受张数上限约束", urls("G6", "U1", 1).length === 1);
-check("缓冲图片：开关关闭后不返回", disabled.pendingImages("G6", "U1").length === 0);
 check(
-  "缓冲图片：带出该图的发送时间（提示词要标注「什么时候发的」）",
-  (() => {
-    const first = history.pendingImages("G6", "U1", 5)[0];
-    return first !== undefined && Math.abs(first.at - Date.now()) < 5_000;
-  })(),
+  "历史图片：只带当前提问者发的图，别人的图不带",
+  !withImages.turns.some((t) => t.images.includes("https://x/other.png")) &&
+    withImages.turns.some((t) => t.images.includes("https://x/new.png")),
 );
+check(
+  "历史图片：同一个 URL 只出现在一轮里",
+  withImages.turns.filter((t) => t.images.includes("https://x/old.png")).length === 1,
+);
+check("历史图片：没指定提问者时不带任何图", !history.render("G6").turns.some((t) => t.images.length > 0));
+check("历史图片：开关关闭后不渲染", disabled.render("G6", { speakerId: "U1" }).turns.length === 0);
 
-// 已答复过的图不再重复注入 —— 这是实测踩过的坑：用户已经说「已经改好了」，
-// 模型手里还挂着 25 分钟前的崩溃截图，于是回「看你发的截图还是会弹严重错误崩溃」并误转交人工。
-history.markImagesAnswered("G6", ["https://x/new.png"]);
-check(
-  "缓冲图片：已答复过的图不再重复注入",
-  JSON.stringify(urls("G6", "U1", 5)) === JSON.stringify(["https://x/old.png"]),
-  "new.png 已被标记为答复过",
-);
-check(
-  "缓冲图片：未答复的图不受影响（下载失败的那次不算答复，下次还能重试）",
-  urls("G6", "U1", 5).includes("https://x/old.png"),
-);
-
-// 时效：截图是有时效的证据，太旧的不能再当成「这次的新截图」
-history.record("G8", { at: Date.now() - 25 * 60_000, role: "user", senderId: "U1", content: "（发了图片）", imageUrls: ["https://x/stale.png"] });
-check(
-  "缓冲图片：超过时效的图不再注入",
-  urls("G8", "U1", 5, 30).length === 1 && urls("G8", "U1", 5, 10).length === 0,
-  "30 分钟内的给、10 分钟前的不给",
-);
-
-// 回归：图后面又聊了好几句（含别人插话），仍要能找到该用户的图 —— 不能按「最近 N 条消息」找
+// 回归：图后面又聊了好几句（含别人插话），该用户的图仍要在
 history.record("G7", { at: Date.now() - 90_000, role: "user", senderId: "U1", content: "（发了图片）", imageUrls: ["https://x/shot.png"] });
 for (let i = 0; i < 6; i += 1) {
   history.record("G7", { at: Date.now() - 60_000 + i, role: "user", senderId: "U2", content: `别人的第 ${i + 1} 句` });
 }
 check(
-  "缓冲图片：中间夹着别人的消息也能找到该用户的图",
-  JSON.stringify(urls("G7", "U1")) === JSON.stringify(["https://x/shot.png"]),
-);
-check("缓冲图片：默认上限取自 IMG_CONTEXT_MAX_COUNT", urls("G7", "U1").length <= historyCfg.IMG_CONTEXT_MAX_COUNT);
-
-// 注入窗口：存储留 6 小时，但注入只看最近 HISTORY_INJECT_MINUTES 分钟（太久以前的会串台）
-history.record("G9", { at: Date.now() - 90 * 60_000, role: "user", content: "一个半小时前聊过的旧话题" });
-history.record("G9", { at: Date.now() - 5 * 60_000, role: "user", content: "刚刚的问题" });
-check(
-  "缓冲：注入窗口比存储窗口紧（1.5 小时前的旧话题不注入）",
-  !history.render("G9").includes("旧话题") && history.render("G9").includes("刚刚的问题"),
+  "历史图片：中间夹着别人的消息也能找到该用户的图",
+  history.render("G7", { speakerId: "U1" }).turns.some((t) => t.images.includes("https://x/shot.png")),
 );
 
-// 机器人自己说过的话：平台上下文覆盖不到它，用平台上下文时要补上，避免重复回答
-history.record("G10", { at: Date.now() - 120_000, role: "user", senderName: "Heuluck", content: "怎么崩了啊" });
-history.record("G10", { at: Date.now() - 110_000, role: "bot", content: "是 5.14.0 旧版的问题，先换成 5.16.0。" });
-history.record("G10", { at: Date.now() - 100_000, role: "user", senderName: "Luck", content: "我也有这个问题" });
-const ownReplies = history.recentBotReplies("G10", "=== 消息 1 ===\n[消息内容] 怎么崩了啊");
+// 10. 多轮 messages 的组装（llm 层）
+const fakeTool = { type: "function", function: { name: "t", parameters: { type: "object" } } } as never;
+const built = buildMessages(
+  {
+    history: [
+      { role: "user", parts: [{ text: "[15:07] 用户Heuluck: 崩了" }, { image: "data:image/png;base64,AAA" }] },
+      { role: "assistant", parts: [{ text: "[15:08] 先换成 5.16.0" }] },
+    ],
+    userParts: [{ text: "问题：已经改好了" }, { image: "data:image/png;base64,BBB" }],
+    tool: fakeTool,
+    execTool: async () => ({ text: "", forwarded: false }),
+  },
+  "SYSTEM",
+);
+check("多轮组装：system 在最前且逐字节稳定", built[0]!.role === "system" && built[0]!.content === "SYSTEM");
 check(
-  "自记回复：平台上下文没有机器人自己的话时补上",
-  ownReplies.length === 1 && ownReplies[0]!.includes("先换成 5.16.0"),
-  ownReplies.join(" | "),
+  "多轮组装：历史按顺序成为独立的 user / assistant 轮",
+  built.length === 4 && built[1]!.role === "user" && built[2]!.role === "assistant" && built[3]!.role === "user",
+  built.map((m) => m.role).join(","),
 );
 check(
-  "自记回复：平台文本里已经出现过的回复不重复带上",
-  history.recentBotReplies("G10", "是 5.14.0 旧版的问题，先换成 5.16.0。").length === 0,
+  "多轮组装：图片留在它自己那一轮",
+  Array.isArray(built[1]!.content) &&
+    (built[1]!.content as { type: string }[]).some((p) => p.type === "image_url") &&
+    built[2]!.content === "[15:08] 先换成 5.16.0",
+  "assistant 轮是纯字符串，没有图",
 );
-check("自记回复：只取机器人的话，不含用户消息", !ownReplies.join("").includes("怎么崩了啊"));
+check(
+  "多轮组装：只有一段文本的历史轮退化成字符串（更紧凑、利于前缀缓存）",
+  buildMessages(
+    { history: [{ role: "user", parts: [{ text: "[15:07] 用户A: 你好" }] }], userParts: [{ text: "问题：在吗" }], tool: fakeTool, execTool: async () => ({ text: "", forwarded: false }) },
+    "S",
+  )[1]!.content === "[15:07] 用户A: 你好",
+);
 
-// 图片来源说明：全是当前消息自带的图时不必解释，翻出来的旧图要写明来源与时间
-const noteMixed = imageNotes([
-  { dataUrl: "", url: "https://x/a.png", bytes: 1, origin: "来自当前这条消息" },
-  { dataUrl: "", url: "https://x/b.png", bytes: 1, origin: `是该用户 15:08 发在群里的历史图片` },
+// 11. 同群串行队列：并发消息不能读到「有问题、还没答复」的中间态
+const enqueue = createSerialQueue();
+const order: string[] = [];
+const slow = async (): Promise<void> => {
+  order.push("A:start");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  order.push("A:end");
+};
+const fast = async (): Promise<void> => {
+  order.push("B:start");
+  order.push("B:end");
+};
+await Promise.all([enqueue("g1", slow), enqueue("g1", fast)]);
+check("串行队列：同一个群的任务排队执行", order.join(",") === "A:start,A:end,B:start,B:end", order.join(","));
+const other: string[] = [];
+await Promise.all([
+  enqueue("g2", async () => {
+    other.push("X:start");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    other.push("X:end");
+  }),
+  enqueue("g3", fast),
 ]);
+check("串行队列：不同群互不阻塞", other.join(",") === "X:start,X:end", other.join(","));
+const failureReason = await enqueue("g4", async () => {
+  throw new Error("boom");
+}).catch((err: Error) => err.message);
 check(
-  "图片说明：混有历史图片时写明来源与时间",
-  noteMixed.includes("第 1 张来自当前这条消息") &&
-    noteMixed.includes("第 2 张是该用户 15:08 发在群里的历史图片") &&
-    noteMixed.includes("可能已经答复过"),
-  noteMixed,
-);
-check(
-  "图片说明：全是当前消息的图时不啰嗦",
-  imageNotes([{ dataUrl: "", url: "https://x/a.png", bytes: 1, origin: "来自当前这条消息" }]) === "" &&
-    imageNotes([]) === "",
-);
-check(
-  "用户消息组装：图片来源说明写进提示词",
-  buildUserText({ question: "还是崩", senderName: "小明", skippedImages: 0, imageNote: noteMixed }).includes(
-    "【本轮图片】",
-  ),
+  "串行队列：前一个任务失败不影响后续排队",
+  failureReason === "boom" && (await enqueue("g4", async () => "ok")) === "ok",
 );
 
 // 10. 正文形态的工具调用（真实泄漏样本）

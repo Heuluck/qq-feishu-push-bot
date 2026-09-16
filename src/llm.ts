@@ -17,10 +17,20 @@ export interface ToolExecutionResult {
 
 export type ToolExecutor = (name: string, argsJson: string) => Promise<ToolExecutionResult>;
 
+/** 一条消息里的内容片段，按顺序排列：一段文本，或一张图片（data URL）。 */
+export type MessagePart = { text: string } | { image: string };
+
+/** 历史里的一轮对话（不含本轮）。文本已渲染好，图片是 data URL。 */
+export interface LlmTurn {
+  role: "user" | "assistant";
+  parts: MessagePart[];
+}
+
 export interface CompleteInput {
-  userText: string;
-  /** 当前消息携带的图片（data URL）。 */
-  images: string[];
+  /** 历史轮次，按时间从早到晚。为空表示这是本会话第一句。 */
+  history: LlmTurn[];
+  /** 本轮提问的内容片段（文本 + 图片，按展示顺序）。 */
+  userParts: MessagePart[];
   tool: ChatCompletionTool;
   execTool: ToolExecutor;
 }
@@ -57,21 +67,16 @@ export class LlmClient {
   }
 
   /**
-   * 请求结构刻意做成「静态前缀 + 单个动态消息」：
-   *   [system: 规则 + 知识库]  → 逐字节稳定，命中厂商前缀缓存
-   *   [user: 本次提问 + 图片]  → 每次唯一，只有它按原价计费
+   * 请求结构：`[system 规则 + 知识库]` + 历史轮次 + `[本轮提问]`。
+   *
+   * 历史用真正的多轮 messages 而不是拼成一段文本，有两个理由：
+   *   - 图片待在它到来的那一轮里，模型才有依据区分「这次发的」和「翻出来的旧图」；
+   *   - 从 system 到历史是**逐字节稳定、只往后追加**的前缀，能命中厂商的前缀缓存，
+   *     只有最新那一轮按原价计费。把整段历史塞进当前那条 user 消息，它每轮都变，缓存全废。
    * 工具定义在每轮都传入且不变，避免破坏前缀。
    */
   async complete(input: CompleteInput, systemPrompt: string): Promise<CompleteResult> {
-    const parts: ChatCompletionContentPart[] = [{ type: "text", text: input.userText }];
-    for (const url of input.images) {
-      parts.push({ type: "image_url", image_url: { url } });
-    }
-
-    const messages: ChatCompletionMessageParam[] = [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: parts },
-    ];
+    const messages = buildMessages(input, systemPrompt);
 
     const deadline = AbortSignal.timeout(this.cfg.LLM_DEADLINE_MS);
     let forwarded = false;
@@ -197,4 +202,46 @@ export class LlmClient {
       `tokens prompt=${u["prompt_tokens"] ?? "?"}（缓存命中=${cached ?? "?"}）completion=${u["completion_tokens"] ?? "?"}`,
     );
   }
+}
+
+/**
+ * 把「system + 历史轮次 + 本轮」组装成请求的 messages。
+ *
+ * 历史是**逐字节稳定、只往后追加**的前缀，所以能被厂商的前缀缓存命中，只有最新那一轮按原价计费。
+ * 反过来，如果把历史拼成一段文本塞进当前那条 user 消息，它每轮都变，缓存全废。
+ */
+export function buildMessages(input: CompleteInput, systemPrompt: string): ChatCompletionMessageParam[] {
+  const messages: ChatCompletionMessageParam[] = [{ role: "system", content: systemPrompt }];
+  for (const turn of input.history) {
+    if (turn.role === "assistant") {
+      // 机器人自己只发文本，不带图。
+      messages.push({ role: "assistant", content: plainText(turn.parts) });
+      continue;
+    }
+    messages.push({ role: "user", content: toContent(turn.parts) });
+  }
+  messages.push({ role: "user", content: toContent(input.userParts) });
+  return messages;
+}
+
+/**
+ * 把内容片段转成 OpenAI 的 content。
+ * 只有一段文本时直接给字符串：更紧凑，也和大多数框架写出来的历史一致，便于命中前缀缓存。
+ */
+function toContent(parts: MessagePart[]): string | ChatCompletionContentPart[] {
+  const [only] = parts;
+  if (parts.length === 1 && only !== undefined && "text" in only) return only.text;
+  return parts.map((part) =>
+    "text" in part
+      ? ({ type: "text", text: part.text } as const)
+      : ({ type: "image_url", image_url: { url: part.image } } as const),
+  );
+}
+
+/** 只取文本片段（assistant 轮从不带图）。 */
+function plainText(parts: MessagePart[]): string {
+  return parts
+    .filter((part): part is { text: string } => "text" in part)
+    .map((part) => part.text)
+    .join("\n");
 }

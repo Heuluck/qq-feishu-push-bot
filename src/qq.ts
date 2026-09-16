@@ -11,10 +11,9 @@ import type { Config } from "./config.js";
 import { splitContextAttachments } from "./context.js";
 import { dumpRawEvent } from "./debugDump.js";
 import type { FeedbackForwarder } from "./forward.js";
-import { hhmm } from "./history.js";
 import type { History } from "./history.js";
 import type { Limits } from "./limits.js";
-import type { LlmClient } from "./llm.js";
+import type { LlmClient, LlmTurn, MessagePart } from "./llm.js";
 import { log, qqLogger } from "./log.js";
 import { normalizeUrl, prepareImageUrls, prepareImages, quotedImageUrls } from "./media.js";
 import type { InboundAttachment, PreparedImage } from "./media.js";
@@ -23,6 +22,32 @@ import { FORWARD_FEEDBACK_TOOL, createToolExecutor } from "./tools.js";
 
 /** 单条回复的分段长度。 */
 const MAX_REPLY_CHARS = 1600;
+
+/**
+ * 按 key 串行执行，后到的任务等前一个跑完。
+ *
+ * 上下文是同群共享的可变状态，而「读历史 → 调模型 → 写回复」这一整段不能被别的消息插进来：
+ * 插进来就会读到「有问题、还没答复」的中间态，历史错乱后模型会把自己的上一轮回答当成新问题，
+ * 出现「自问自答」（中文社区有同构的踩坑记录）。CowAgent 的默认也是这个语义
+ * （`concurrency_in_session: 1`，注释直写 >1 可能导致回复乱序）。
+ */
+export function createSerialQueue(): <T>(key: string, task: () => Promise<T>) => Promise<T> {
+  const tails = new Map<string, Promise<unknown>>();
+  return <T>(key: string, task: () => Promise<T>): Promise<T> => {
+    const previous = tails.get(key) ?? Promise.resolve();
+    // 前一个任务失败也要继续排队，所以 onFulfilled / onRejected 都指向 task。
+    const next = previous.then(task, task);
+    const settled = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    tails.set(key, settled);
+    void settled.then(() => {
+      if (tails.get(key) === settled) tails.delete(key);
+    });
+    return next;
+  };
+}
 
 /**
  * QQ 单条文本长度有限，长回复按段落拆成多条发送（SDK 会自动递增 msg_seq）。
@@ -58,52 +83,25 @@ export function splitReply(text: string, max = MAX_REPLY_CHARS, maxChunks = 3): 
 }
 
 export const PLATFORM_CONTEXT_LABEL =
-  "[对话上下文] 这条消息之前群里的最近几条消息（含机器人此前的回复，可能含其他成员的消息与附件）：";
-export const LOCAL_CONTEXT_LABEL =
-  "[近期对话记录] 本机器人记录的本群最近交互（用户 @ 消息与机器人的回复），按时间从早到晚：";
-export const OWN_REPLIES_LABEL =
-  "[机器人自己说过的话] 平台给的上下文里没有这一段，由本机器人补记，用来避免重复回答已经答过的问题：";
-
-/** 本轮图片的来源，写进提示词让模型知道每张图是新的还是翻出来的旧图。 */
-const IMAGE_ORIGINS = {
-  message: "来自当前这条消息",
-  quote: "来自被引用的那条消息",
-  history: (at: number): string => `是该用户 ${hhmm(at)} 发在群里的历史图片`,
-  context: "来自平台给的上下文",
-} as const;
-
-/** 本轮要喂的一张图 + 它在提示词里的来源说明。 */
-interface TurnImage extends PreparedImage {
-  origin: string;
-}
+  "[对话上下文] 平台给的背景：这条消息之前群里的最近几条消息，可能含其他成员的消息与附件。它是背景，不是这次要处理的新问题";
 
 /**
- * 向模型交代本轮图片的来源与时间。
+ * 平台给的上下文渲染成一个内容片段。
  *
- * 只说「有图」不够：实测模型会把从上下文里翻出来的旧截图当成当前消息的新证据——
- * 用户已经说「已经改好了」（话题是补卡），模型手里那张 25 分钟前的崩溃截图还在，
- * 于是回了「看你发的截图还是会弹严重错误崩溃」，并因此误转交了一次人工。
- * 全是当前消息自带的图时不必解释，那是默认理解，说了只是噪音。
+ * 这段文本是平台预渲染好的，没有发言人归属、也没有每条的发言时间，拼不出「轮次」，
+ * 所以只能整段跟在问题后面当背景，不能塞进历史里当一轮。
+ * 它的图片紧跟在说明文字之后——位置在说明之后，模型才能知道这些是背景里的图，不是这次发的。
  */
-export function imageNotes(images: TurnImage[]): string {
-  if (images.length === 0 || images.every((image) => image.origin === IMAGE_ORIGINS.message)) return "";
-  const describes = images.map((image, index) => `第 ${index + 1} 张${image.origin}`);
-  return (
-    `【本轮图片】共 ${images.length} 张，按顺序：${describes.join("；")}。` +
-    "不是来自当前这条消息的图可能已经答复过，只在确实与当前问题相关时才作为依据。"
-  );
+export function platformBackground(text: string): string {
+  return `${PLATFORM_CONTEXT_LABEL}：\n${text}`;
 }
 
 export function buildUserText(args: {
   question: string;
-  contextText?: string;
-  contextLabel?: string;
   senderName?: string;
   skippedImages: number;
   /** 今天的读图额度已用完：要照常回答文字问题，但明确告诉用户图看不了了。 */
   imageQuotaExhausted?: boolean;
-  /** 本轮图片的来源与时间说明（见 {@link imageNotes}）。 */
-  imageNote?: string;
 }): string {
   const lines: string[] = [];
   if (args.senderName) lines.push(`（发送者：${args.senderName}）`);
@@ -119,12 +117,7 @@ export function buildUserText(args: {
         "然后请他先用文字描述，或明天再发图。转交时也要写这句。",
     );
   }
-  lines.push(args.question !== "" ? `问题：${args.question}` : "问题：（无文字，见下面的上下文或图片）");
-  if (args.imageNote) lines.push(args.imageNote);
-  if (args.contextText) {
-    lines.push(args.contextLabel ?? PLATFORM_CONTEXT_LABEL);
-    lines.push(args.contextText);
-  }
+  lines.push(args.question !== "" ? `问题：${args.question}` : "问题：（无文字，见上面的历史或下面的图片）");
   return lines.join("\n");
 }
 
@@ -153,6 +146,7 @@ export interface QqDeps {
 
 export function createQqBot(deps: QqDeps): QQBot {
   const { cfg, llm, forwarder, limits, history, systemPrompt } = deps;
+  const enqueue = createSerialQueue();
   const bot = new QQBot({
     appId: cfg.QQBOT_APP_ID,
     appSecret: cfg.QQBOT_APP_SECRET,
@@ -234,7 +228,8 @@ export function createQqBot(deps: QqDeps): QQBot {
       return;
     }
 
-    {
+    // 同群串行：整段「读历史 → 调模型 → 写回复」不能被打断，否则后一条消息读到的是中间态。
+    await enqueue(msg.groupOpenid ?? "", async () => {
       const quote = ctx.state.quote as ResolvedQuote | undefined;
       const platformContext = quote?.text
         ? splitContextAttachments(quote.text, {
@@ -242,37 +237,24 @@ export function createQqBot(deps: QqDeps): QQBot {
             maxPerMessage: cfg.CONTEXT_MESSAGE_MAX_CHARS,
           })
         : { text: "", imageUrls: [] as string[], truncated: false };
-      // 平台给了上下文就用平台的（它还能看到非 @ 消息与图片），同时不能丢机器人自己说过的话：
-      // 平台那段附件覆盖不到机器人自己的回复，缺了它就会出现「上一轮已经答过、这一轮又从头答一遍」。
-      const localContext = history.render(msg.groupOpenid ?? "");
-      const usePlatform = platformContext.text !== "";
-      const ownReplies = usePlatform ? history.recentBotReplies(msg.groupOpenid ?? "", platformContext.text) : [];
-      const contextText = usePlatform
-        ? [platformContext.text, ownReplies.length > 0 ? `${OWN_REPLIES_LABEL}\n${ownReplies.join("\n")}` : ""]
-            .filter((part) => part !== "")
-            .join("\n")
-        : localContext;
-      const contextLabel = usePlatform ? PLATFORM_CONTEXT_LABEL : LOCAL_CONTEXT_LABEL;
-      const contextSource = usePlatform
-        ? ownReplies.length > 0
-          ? `平台+自记回复 ${ownReplies.length} 条`
-          : "平台"
-        : localContext !== ""
-          ? "本地缓冲"
-          : "无";
       const question = truncateText((msg.content ?? "").trim(), cfg.QUESTION_MAX_CHARS);
       const attachments: InboundAttachment[] = msg.attachments ?? [];
       const hasImage = attachments.some((att) => att.content_type?.startsWith("image/"));
       // 被引用消息里的图片（结构化附件），优先级高于平台上下文文本里的图片。
       const quotedImages = quotedImageUrls(quote?.attachments);
 
+      // 历史渲染成真正的多轮 messages，图挂在它到来的那一轮上。
+      // 必须在记录本轮提问**之前**渲染，否则当前问题会在历史里出现两次。
+      const rendered = history.render(msg.groupOpenid ?? "", { speakerId: msg.senderId });
+
       // 群 openid 首次出现在日志里，方便填进 .env 的 QQ_GROUP_OPENID。
       log.info("qq", `收到群消息 group=${msg.groupOpenid ?? "?"} sender=${msg.senderId}`);
       log.info(
         "qq",
-        contextText === ""
-          ? "本轮上下文：无"
-          : `本轮上下文：${contextText.length} 字符，来源=${contextSource}${platformContext.truncated ? "（平台内容已截断）" : ""}`,
+        rendered.turns.length === 0
+          ? "本轮历史：无（新会话，或已超过会话窗口）"
+          : `本轮历史：${rendered.turns.length} 轮` +
+            (rendered.dropped > 0 ? `（另有 ${rendered.dropped} 条超出会话窗口或字符预算，未带上）` : ""),
       );
       dumpRawEvent("group-message", {
         rawEventType: msg.rawEventType,
@@ -286,37 +268,37 @@ export function createQqBot(deps: QqDeps): QQBot {
         messageScene: msg.messageScene,
         context: {
           source: quote?.source,
+          historyTurns: rendered.turns,
           platformText: platformContext.text,
           platformImageUrls: platformContext.imageUrls,
           trunc: platformContext.truncated,
-          localText: localContext,
         },
         raw: msg.raw,
       });
 
-      // 完全空的消息（只 @ 了一下、没有文字/图片/上下文）也交给模型自由发挥，
-      // 不再用固定的模板文案。
-      const nothingAtAll = question === "" && !hasImage && quotedImages.length === 0 && contextText === "";
+      // 完全空的消息（只 @ 了一下、没有文字/图片/历史）也交给模型自由发挥。
+      const nothingAtAll =
+        question === "" &&
+        !hasImage &&
+        quotedImages.length === 0 &&
+        rendered.turns.length === 0 &&
+        platformContext.text === "";
       const modelQuestion = nothingAtAll ? "（用户只 @ 了你，没有说任何内容）" : question;
 
       const started = Date.now();
-      // 图片配额有两层：单次上限（消息/引用 2 张、上下文 5 张）与单用户每日读取上限。
-      // 每日额度用完时不读图，但仍然回答文字问题，并在提示里说明额度已用完。
+      // 图片额度分两层：各来源的张数上限，以及单用户每日**新读**上限。
+      // 额度按「真正下载了几张」算：同一张图第二次遇到就走缓存，不重复扣，
+      // 否则用户发一张截图聊三句，今天的额度就用完了。
       const dailyBudget = limits.imageBudget(msg.senderId);
-      const images: TurnImage[] = [];
-      const slotsLeft = (): number => dailyBudget - images.length;
-
-      const prepared = await prepareImages(attachments, cfg, Math.min(cfg.IMG_MAX_COUNT, slotsLeft()));
-      // 同一个 URL 只取一次：同一张图可能同时出现在多个来源里，重复喂等于白花钱。
-      const usedUrls = new Set(
-        attachments
-          .filter((att) => att.content_type?.startsWith("image/") && typeof att.url === "string")
-          .slice(0, cfg.IMG_MAX_COUNT)
-          .map((att) => normalizeUrl(att.url)),
-      );
-
-      // 同一个 URL 只取一次：同一张图可能同时出现在多个来源里，重复喂等于白花钱。
-      // 各来源的张数上限由各自的 prepareImageUrls 负责，这里只管去重。
+      let downloaded = 0;
+      let skippedForQuota = 0;
+      const newSlots = (): number => Math.max(0, dailyBudget - downloaded);
+      const account = (batch: { downloaded: number; skippedForQuota: number }): void => {
+        downloaded += batch.downloaded;
+        skippedForQuota += batch.skippedForQuota;
+      };
+      // 同一个 URL 只喂一次：同一张图可能同时出现在当前消息、引用、历史、平台文本里。
+      const usedUrls = new Set<string>();
       const takeNew = (urls: string[]): string[] =>
         urls.filter((url) => {
           const key = normalizeUrl(url);
@@ -324,49 +306,67 @@ export function createQqBot(deps: QqDeps): QQBot {
           usedUrls.add(key);
           return true;
         });
+      const toParts = (images: PreparedImage[]): MessagePart[] => images.map((image) => ({ image: image.dataUrl }));
 
-      images.push(...prepared.images.map((image) => ({ ...image, origin: IMAGE_ORIGINS.message })));
-      const quoteSlots = Math.max(0, Math.min(cfg.IMG_MAX_COUNT - images.length, slotsLeft()));
-      const quoteCandidates = quoteSlots > 0 ? takeNew(quotedImages) : [];
-      const fromQuote = await prepareImageUrls(quoteCandidates, cfg, quoteSlots);
-      images.push(...fromQuote.map((image) => ({ ...image, origin: IMAGE_ORIGINS.quote })));
+      // 1) 当前消息自带的附件
+      const prepared = await prepareImages(attachments, cfg, cfg.IMG_MAX_COUNT, newSlots());
+      account(prepared);
+      // 只把**真的取到**的标成已用：下载失败的那张留给后面的来源再试一次。
+      takeNew(prepared.images.map((image) => image.url));
 
-      // 「用户先发截图、再 @ 提问」时，截图只存在于缓冲里：按「该用户最近的图」找，
-      // 不受消息条数限制（中间夹了别人的消息也能找到），最多 IMG_CONTEXT_MAX_COUNT 张。
-      // 已经答复过、或超过 IMG_CONTEXT_MAX_AGE_MINUTES 分钟的图不再带上——见 pendingImages。
-      const historySlots = Math.max(0, Math.min(cfg.IMG_CONTEXT_MAX_COUNT, slotsLeft()));
-      const pendingImages =
-        historySlots > 0 ? history.pendingImages(msg.groupOpenid ?? "", msg.senderId, historySlots) : [];
-      // 按 URL 回查每张图是什么时候发的，交给 imageNotes 写进提示词。
-      const sentAt = new Map(pendingImages.map((item) => [item.url, item.at]));
-      const historyCandidates = takeNew(pendingImages.map((item) => item.url));
-      const fromHistory = await prepareImageUrls(historyCandidates, cfg, historySlots);
-      images.push(
-        ...fromHistory.map((image) => ({
-          ...image,
-          origin: IMAGE_ORIGINS.history(sentAt.get(image.url) ?? Date.now()),
-        })),
-      );
+      // 2) 被引用消息里的图片（平台不会把它渲染进上下文文本，必须单独读）
+      const fromQuote = await prepareImageUrls(takeNew(quotedImages), cfg, cfg.IMG_MAX_COUNT, newSlots());
+      account(fromQuote);
 
-      const contextSlots = Math.max(0, Math.min(cfg.IMG_MAX_COUNT, slotsLeft()));
-      const contextCandidates = contextSlots > 0 && usePlatform ? takeNew(platformContext.imageUrls) : [];
-      const fromContext = await prepareImageUrls(contextCandidates, cfg, contextSlots);
-      images.push(...fromContext.map((image) => ({ ...image, origin: IMAGE_ORIGINS.context })));
-
-      const imageCandidates =
-        prepared.total + quotedImages.length + historyCandidates.length + platformContext.imageUrls.length;
-      const skippedImages =
-        prepared.skipped +
-        Math.max(0, quotedImages.length - fromQuote.length) +
-        Math.max(0, platformContext.imageUrls.length - fromContext.length);
-      // 每日读图额度用完（且本来有图可读）→ 让模型在回复里告诉用户
-      const quotaExhausted = images.length >= dailyBudget && imageCandidates > images.length;
-      if (images.length > 0) limits.consumeImages(msg.senderId, images.length);
-      if (quotaExhausted) {
-        log.info("qq", `读图额度已用完（今日上限 ${cfg.IMG_DAILY_LIMIT_PER_USER} 张），本次仅读 ${images.length} 张`);
+      // 3) 历史轮次：图挂在**它自己那一轮**上，不挪到当前轮——位置本身就是模型区分新旧的依据
+      const historyTurns: LlmTurn[] = [];
+      let historyImageCount = 0;
+      for (const turn of rendered.turns) {
+        const role = turn.role === "bot" ? ("assistant" as const) : ("user" as const);
+        if (turn.images.length === 0) {
+          historyTurns.push({ role, parts: [{ text: turn.text }] });
+          continue;
+        }
+        const batch = await prepareImageUrls(takeNew(turn.images), cfg, turn.images.length, newSlots());
+        account(batch);
+        historyImageCount += batch.images.length;
+        historyTurns.push({ role, parts: [{ text: turn.text }, ...toParts(batch.images)] });
       }
 
-      // 先渲染上下文、再记录本轮提问，避免当前问题在上下文里出现两次。
+      // 4) 平台上下文里的图片：平台那段文本拼不出轮次，只能整段当背景，图紧跟在说明之后
+      const fromContext = await prepareImageUrls(
+        platformContext.text !== "" ? takeNew(platformContext.imageUrls) : [],
+        cfg,
+        cfg.IMG_MAX_COUNT,
+        newSlots(),
+      );
+      account(fromContext);
+
+      const skippedImages = prepared.skipped + Math.max(0, quotedImages.length - fromQuote.images.length);
+      const quotaExhausted = skippedForQuota > 0;
+      if (downloaded > 0) limits.consumeImages(msg.senderId, downloaded);
+      if (quotaExhausted) {
+        log.info("qq", `读图额度已用完（今日上限 ${cfg.IMG_DAILY_LIMIT_PER_USER} 张），本次放弃 ${skippedForQuota} 张`);
+      }
+
+      const userParts: MessagePart[] = [
+        {
+          text: buildUserText({
+            question: modelQuestion,
+            senderName: msg.senderName,
+            skippedImages,
+            ...(quotaExhausted ? { imageQuotaExhausted: true } : {}),
+          }),
+        },
+        ...toParts(prepared.images),
+        ...toParts(fromQuote.images),
+      ];
+      if (platformContext.text !== "") {
+        userParts.push({ text: platformBackground(platformContext.text) });
+        userParts.push(...toParts(fromContext.images));
+      }
+
+      // 记录本轮提问：放在渲染历史之后，当前问题才不会在历史里出现两次。
       history.record(msg.groupOpenid ?? "", {
         at: Date.now(),
         role: "user",
@@ -381,26 +381,11 @@ export function createQqBot(deps: QqDeps): QQBot {
             }
           : {}),
       });
-      // 这一轮真正喂进去的图都记成「已答复」，下一轮不再重复注入（见 History.pendingImages）。
-      // 必须在 record 之后调用：当前这条消息刚记进去，它自带的图也要一起标记。
-      history.markImagesAnswered(
-        msg.groupOpenid ?? "",
-        images.map((image) => image.url),
-      );
 
-      const note = imageNotes(images);
       const result = await llm.complete(
         {
-          userText: buildUserText({
-            question: modelQuestion,
-            contextText,
-            contextLabel,
-            senderName: msg.senderName,
-            skippedImages,
-            ...(quotaExhausted ? { imageQuotaExhausted: true } : {}),
-            ...(note !== "" ? { imageNote: note } : {}),
-          }),
-          images: images.map((image) => image.dataUrl),
+          history: historyTurns,
+          userParts,
           tool: FORWARD_FEEDBACK_TOOL,
           execTool: createToolExecutor(forwarder, {
             msgId: msg.messageId,
@@ -422,12 +407,16 @@ export function createQqBot(deps: QqDeps): QQBot {
       for (const chunk of splitReply(reply, MAX_REPLY_CHARS, cfg.REPLY_MAX_CHUNKS)) {
         await bot.sendText(msg.replyTarget, chunk);
       }
+      // 回复也要进历史：用户接着上一轮的答复追问时，模型得知道自己说过什么。
       history.record(msg.groupOpenid ?? "", { at: Date.now(), role: "bot", content: reply });
       log.info(
         "qq",
-        `回复完成 ${Date.now() - started}ms｜转交=${result.forwarded}｜图片=${images.length}（消息附件 ${prepared.images.length}/${attachments.length}，引用 ${fromQuote.length}/${quotedImages.length}，缓冲 ${fromHistory.length}，上下文 ${fromContext.length}/${platformContext.imageUrls.length}）｜上下文来源=${contextSource}`,
+        `回复完成 ${Date.now() - started}ms｜转交=${result.forwarded}｜历史 ${historyTurns.length} 轮` +
+          `（历史图 ${historyImageCount} 张）｜本图 消息 ${prepared.images.length}/${attachments.length}` +
+          `、引用 ${fromQuote.images.length}/${quotedImages.length}｜新读 ${downloaded} 张` +
+          `（缓存 ${prepared.cached + fromQuote.cached + fromContext.cached}）｜平台背景=${platformContext.text !== ""}`,
       );
-    }
+    });
   });
 
   return bot;

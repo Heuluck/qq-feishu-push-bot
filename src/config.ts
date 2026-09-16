@@ -55,19 +55,12 @@ const EnvSchema = z.object({
   IMG_MAX_COUNT: z.coerce.number().int().min(0).max(4).default(2),
   IMG_MAX_BYTES: z.coerce.number().int().min(1024).default(10 * 1024 * 1024),
   /**
-   * 上下文（对话缓冲）里最多为该用户读几张图。
+   * 上下文（对话缓冲）里最多为该用户挑几张图。
    * 与 IMG_MAX_COUNT（单条消息自带的图）分开算：用户常常连发几张截图、中间还夹着别人的消息，
    * 因此按「该用户最近的图」去找，而不是按「最近 N 条消息」去找。
+   * 挑中的图挂在**它到来的那一轮**上——不设「已答复就不再喂」这类时效闸门，理由见 src/history.ts。
    */
   IMG_CONTEXT_MAX_COUNT: z.coerce.number().int().min(0).max(20).default(5),
-  /**
-   * 缓冲里的图只回看最近多少分钟（默认 30）。
-   *
-   * 截图是有时效的证据：用户 25 分钟前发的那张崩溃截图，在「已经改好了」这一轮再喂给模型，
-   * 它会把旧图当成当前消息的新证据（实测就因此误转交了一次人工）。加上「已经答复过的图不再
-   * 重复注入」（见 `History.pendingImages`），两道一起挡住这种情况。
-   */
-  IMG_CONTEXT_MAX_AGE_MINUTES: z.coerce.number().int().min(1).max(1_440).default(30),
   /** 同一个用户每天最多读几张图（超出后仍回答文字问题，但会告知用户读图额度用完）。 */
   IMG_DAILY_LIMIT_PER_USER: z.coerce.number().int().min(1).max(1000).default(10),
 
@@ -86,18 +79,19 @@ const EnvSchema = z.object({
   /** 本地对话缓冲保留多久（分钟），默认 6 小时。 */
   HISTORY_WINDOW_MINUTES: z.coerce.number().int().min(1).max(10_080).default(360),
   /**
-   * 注入时只回看最近多少分钟（默认 1 小时）。
+   * 会话窗口：多久没说话就当开了新会话（分钟，默认 1 小时）。
    *
-   * 与 `HISTORY_WINDOW_MINUTES`（存储窗口，6 小时）分开：存储要留久一点，
-   * 但注入太旧的内容会串台——群里半小时前聊的话题已经翻篇，再喂给模型只会干扰判断。
+   * 这是各家对话平台的通行约定——Dialogflow CX 默认 30 分钟、Rasa 60 分钟、Amazon Lex 5 分钟。
+   * 与 `HISTORY_WINDOW_MINUTES`（存储窗口，6 小时）分开：存储要留久一点，但太旧的内容喂给模型
+   * 只会串台，群里半小时前的话题早翻篇了。
    */
   HISTORY_INJECT_MINUTES: z.coerce.number().int().min(1).max(10_080).default(60),
   /**
-   * 本地对话缓冲最多注入几条（默认最近 30 条）。
+   * 一次带几轮历史（默认 30 轮，一轮 = 一条用户消息或一条机器人的回复）。
    *
-   * 条数是防刷屏的下限保护，真正的成本上限是 `CONTEXT_MAX_CHARS`。条数给小了会出问题：
-   * 实测一次两人交错的对话，10 条只覆盖几分钟，机器人自己刚说过的「先升到 5.16.0」
-   * 被挤出窗口，于是下一轮又把同一个问题从头答了一遍。
+   * 条数是防刷屏的兜底；真正的成本上限是 `CONTEXT_MAX_CHARS`，超出时**整轮**丢弃（不会把
+   * 「提问」和它的「回答」切开）。别的框架的默认量级可以参考：LangChain 滑窗记忆 k=5（10 条）、
+   * FastGPT 6 轮、LangBot 10 轮、CowAgent 的 agent 模式 30 轮。
    */
   HISTORY_MAX_ENTRIES: z.coerce.number().int().min(1).max(100).default(30),
   /** 本地对话缓冲最多存放几条（只影响存储；留多一些，方便以后调大注入条数）。 */

@@ -28,12 +28,70 @@ export interface PreparedImage {
   bytes: number;
 }
 
+export interface PreparedImageBatch {
+  images: PreparedImage[];
+  /** 复用本地缓存的张数（不消耗每日额度）。 */
+  cached: number;
+  /** 真正下载处理的张数（要计入每日读图额度）。 */
+  downloaded: number;
+  /** 因为每日额度用完而主动放弃的张数。 */
+  skippedForQuota: number;
+}
+
+/**
+ * 处理好的图片在本进程内缓存。
+ *
+ * 历史里的图在每一轮都要重新交给模型（图留在它到来的那一轮，见 `src/history.ts`），
+ * 所以同一张截图一小时内会被问很多次。没有这层缓存，每一轮都要重新下载 + 缩放，
+ * 而且会把「今天读了几张图」的额度反复扣掉——用户发一张截图聊三句就没额度了。
+ */
+const CACHE_MAX_ITEMS = 60;
+/** 缓存的总字节上限，防止大量截图把内存吃掉。 */
+const CACHE_MAX_BYTES = 24 * 1024 * 1024;
+const preparedCache = new Map<string, Omit<PreparedImage, "url">>();
+let preparedCacheBytes = 0;
+
+function cacheGet(key: string): Omit<PreparedImage, "url"> | undefined {
+  const hit = preparedCache.get(key);
+  if (hit === undefined) return undefined;
+  // 命中的挪到末尾：Map 的迭代顺序就是 LRU 的淘汰顺序。
+  preparedCache.delete(key);
+  preparedCache.set(key, hit);
+  return hit;
+}
+
+function cacheSet(key: string, image: Omit<PreparedImage, "url">): void {
+  if (image.bytes > CACHE_MAX_BYTES) return;
+  const previous = preparedCache.get(key);
+  if (previous !== undefined) preparedCacheBytes -= previous.bytes;
+  preparedCache.set(key, image);
+  preparedCacheBytes += image.bytes;
+  while (preparedCache.size > CACHE_MAX_ITEMS || preparedCacheBytes > CACHE_MAX_BYTES) {
+    const oldest = preparedCache.keys().next().value;
+    if (oldest === undefined) break;
+    preparedCacheBytes -= preparedCache.get(oldest)?.bytes ?? 0;
+    preparedCache.delete(oldest);
+  }
+}
+
+/** 仅供 smoke 用例复位缓存用。 */
+export function clearPreparedImageCache(): void {
+  preparedCache.clear();
+  preparedCacheBytes = 0;
+}
+
 export interface PrepareImagesResult {
   images: PreparedImage[];
   /** 有图但没能处理的张数（下载失败/过大/超过张数上限）。 */
   skipped: number;
   /** 消息里图片总数。 */
   total: number;
+  /** 其中复用本地缓存的张数。 */
+  cached: number;
+  /** 真正下载处理的张数。 */
+  downloaded: number;
+  /** 因为每日额度用完而放弃的张数。 */
+  skippedForQuota: number;
 }
 
 const FETCH_TIMEOUT_MS = 15_000;
@@ -86,38 +144,69 @@ export async function prepareImages(
   attachments: InboundAttachment[],
   cfg: Config,
   max = cfg.IMG_MAX_COUNT,
+  maxNew = Number.POSITIVE_INFINITY,
 ): Promise<PrepareImagesResult> {
   const imageAtts = attachments.filter(
     (att) => typeof att.content_type === "string" && att.content_type.startsWith("image/") && typeof att.url === "string",
   );
   const picked = max > 0 ? imageAtts.slice(0, max) : [];
-  const images = await prepareImageUrls(picked.map((att) => att.url), cfg, max);
-  return { images, skipped: imageAtts.length - images.length, total: imageAtts.length };
+  const prepared = await prepareImageUrls(picked.map((att) => att.url), cfg, max, maxNew);
+  return {
+    images: prepared.images,
+    skipped: imageAtts.length - prepared.images.length,
+    total: imageAtts.length,
+    cached: prepared.cached,
+    downloaded: prepared.downloaded,
+    skippedForQuota: prepared.skippedForQuota,
+  };
 }
 
 /**
- * 按 URL 下载并缩放图片。用于两类来源：当前消息的附件，以及上下文文本里
- * 抠出来的图片（上下文里的图只有 URL，模型看不见，必须抓下来喂进去）。
- * 超出 max 张数的 URL 计为跳过。
+ * 按 URL 准备图片。用于三类来源：当前消息的附件、被引用消息的图片、以及历史轮次里该用户的图片。
+ *
+ * `max` 限制这一来源最多要几张；`maxNew` 限制其中最多**下载**几张——缓存命中的不受它约束，
+ * 这样每日额度用完之后，之前读过的图仍然能正常出现在历史里。
+ * 处理结果按 URL 缓存，同一张图只下载一次。
  */
-export async function prepareImageUrls(urls: string[], cfg: Config, max = cfg.IMG_MAX_COUNT): Promise<PreparedImage[]> {
+export async function prepareImageUrls(
+  urls: string[],
+  cfg: Config,
+  max = cfg.IMG_MAX_COUNT,
+  maxNew = Number.POSITIVE_INFINITY,
+): Promise<PreparedImageBatch> {
   const images: PreparedImage[] = [];
+  let cached = 0;
+  let downloaded = 0;
+  let skippedForQuota = 0;
   for (const url of urls.slice(0, max)) {
+    const key = normalizeUrl(url);
+    const hit = cacheGet(key);
+    if (hit !== undefined) {
+      images.push({ ...hit, url });
+      cached += 1;
+      continue;
+    }
+    if (downloaded >= maxNew) {
+      skippedForQuota += 1;
+      continue;
+    }
     try {
-      const raw = await fetchBytes(normalizeUrl(url), cfg.IMG_MAX_BYTES);
+      const raw = await fetchBytes(key, cfg.IMG_MAX_BYTES);
       const prepared = await resizeImageBuffer(raw, cfg);
       const meta = await sharp(prepared.data).metadata();
-      images.push({
+      const image = {
         dataUrl: `data:${prepared.mime};base64,${prepared.data.toString("base64")}`,
-        url,
         width: meta.width,
         height: meta.height,
         bytes: prepared.data.byteLength,
-      });
+      };
+      cacheSet(key, image);
+      images.push({ ...image, url });
+      downloaded += 1;
       log.debug("media", `图片已处理：${meta.width}x${meta.height}, ${prepared.data.byteLength} 字节（${prepared.mime}）`);
     } catch (err) {
       log.warn("media", `图片处理失败已跳过：${err instanceof Error ? err.message : String(err)}`);
     }
   }
-  return images;
+  return { images, cached, downloaded, skippedForQuota };
 }

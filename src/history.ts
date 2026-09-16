@@ -5,39 +5,53 @@ import { log } from "./log.js";
 import { truncateText } from "./text.js";
 
 /**
- * 本地对话缓冲：记录本群「用户 @ 消息」与「机器人回复」，默认保留最近 6 小时。
+ * 本地对话缓冲：记录本群「用户 @ 消息」「机器人回复」，以及在平台投递全量消息时的普通消息。
  *
- * 用途：平台的群聊上下文附件并不可靠（实测在部分场景下不投递，纯 @ 消息根本不带），
- * 平台给了就用平台的（它还能看到非 @ 消息和图片），没给就退回这里，
- * 保证「用户接着上一轮追问」这类场景不会失忆。
+ * 用途：平台的群聊上下文附件并不可靠（实测在部分场景下不投递，纯 @ 消息根本不带）。
+ * 这份缓冲被渲染成**多轮 messages 的历史部分**，是上下文的主要来源。
+ *
+ * 为什么是多轮 messages，而不是把历史拼成一段文本塞进当前那条 user 消息：
+ *
+ *   1. **图片必须待在它到来时的那一轮。** 拼成一段文本时，翻出来的旧截图只能作为「当前这条
+ *      消息」的附件交给模型，模型没有依据区分新旧——实测它把 25 分钟前的崩溃截图当成这次的
+ *      新证据，回了「看你发的截图还是会弹严重错误崩溃」，并因此误转交了一次人工。
+ *      Anthropic 的 vision 文档给的就是这个模型：图留在原始轮次，模型能看到历史里的所有图，
+ *      但不要在新增的那一轮里重复贴。
+ *   2. **历史成为请求前缀的一部分**，可以命中厂商的前缀缓存，只有最新那一轮按原价计费。
+ *      「把历史里的图删掉」看着省 token，实际会让缓存从改动点起整段失效——OpenAI 与 Anthropic
+ *      的缓存文档都明确写了这一点，删一张图远不够抵消这个代价。
  */
 export interface HistoryEntry {
   at: number;
   role: "user" | "bot";
-  /** 用户 openid（机器人自己的记录没有）。用于「只取同一个用户发的图」。 */
+  /** 用户 openid（机器人自己的记录没有）。用于按提问者挑图与区分发言人。 */
   senderId?: string;
   senderName?: string;
   content: string;
-  /** 这条消息带的图片 URL（用来支持「用户先发截图、再 @ 提问」）。 */
+  /** 这条消息带的图片 URL，渲染时挂在**这一轮**上。 */
   imageUrls?: string[];
-  /**
-   * 这些图已经被喂给模型的时间。
-   *
-   * 「已经答复过的图不再重复注入」是必须的：模型看过那张图并答复之后，后续每一轮
-   * 再带上它，模型就会把旧截图当成当前消息的新证据。实测踩过——用户已经说「已经改好了」，
-   * 模型手里还挂着 25 分钟前那张崩溃截图，于是回了「看你发的截图还是会弹严重错误崩溃」
-   * 并误转交了一次人工。
-   */
-  imagesAnsweredAt?: number;
 }
 
-/** 缓冲里待注入的一张图，附带它在该群出现的时间。 */
-export interface PendingImage {
-  url: string;
-  /** 这张图在该群出现的时间戳（给提示词标注「什么时候发的」用）。 */
-  at: number;
+/** 渲染给模型的一轮。 */
+export interface HistoryTurn {
+  role: "user" | "bot";
+  /** 该轮要喂的图片 URL（原始形态，由调用方下载）。 */
+  images: string[];
+  /** 已渲染好的文本：user 轮形如 `[15:08] Luck: 我也有这个问题`，bot 轮只有时间戳。 */
+  text: string;
 }
 
+export interface RenderedHistory {
+  turns: HistoryTurn[];
+  /** 因为条数或字符预算被丢掉的轮数（日志用）。 */
+  dropped: number;
+}
+
+/** 渲染历史时需要的当前提问者信息。 */
+export interface RenderOptions {
+  /** 当前提问者的 openid：只为他挑图，别人发的图与当前问题无关。 */
+  speakerId?: string;
+}
 
 export class History {
   private readonly byGroup = new Map<string, HistoryEntry[]>();
@@ -65,7 +79,7 @@ export class History {
         log.info(
           "history",
           `已载入 ${this.byGroup.size} 个群的近况（${kept} 条，存储窗口 ${this.cfg.HISTORY_WINDOW_MINUTES} 分钟，最多存 ${this.cfg.HISTORY_MAX_STORED} 条；` +
-            `注入最近 ${this.cfg.HISTORY_INJECT_MINUTES} 分钟内 ${this.cfg.HISTORY_MAX_ENTRIES} 条）`,
+            `会话窗口 ${this.cfg.HISTORY_INJECT_MINUTES} 分钟内 ${this.cfg.HISTORY_MAX_ENTRIES} 轮）`,
         );
       }
     } catch {
@@ -82,88 +96,36 @@ export class History {
   }
 
   /**
-   * 该用户发过、**还没喂给过模型**的图，最新的优先。
+   * 渲染成本轮的历史轮次（不含当前这条消息）。
    *
-   * 用途：「用户先发一张报错截图、再 @ 机器人问一句」是最常见的用法，
-   * 而截图那条消息没 @ 机器人，只进了缓冲——不把图抓下来，模型就只能说"看不清内容"。
-   * 只取**同一个用户**发的图：群里其他人的截图与当前问题无关，带上既费 token 又可能干扰判断。
-   * 不按「最近 N 条消息」找，而是按「该用户最近的图」找——用户连发几张截图后，中间很可能插入别人的消息，
-   * 按消息条数回看会把这些图挤出去（实测踩过：截图 5 条消息之前，于是一张都没带上）。
-   *
-   * 两道时效限制，缺一个都会出问题（见 `HistoryEntry.imagesAnsweredAt` 与
-   * `IMG_CONTEXT_MAX_AGE_MINUTES` 的注释）：已经答复过的不再给，超过
-   * `IMG_CONTEXT_MAX_AGE_MINUTES` 分钟的也不再给。
+   * 图只挑**当前提问者**发过的：群里别人的截图与当前问题无关，带上既费 token 又可能干扰判断。
+   * 不按「最近 N 条消息」找图，而是按「该用户最近的图」找——用户连发几张截图后中间常会插入
+   * 别人的消息，按消息条数回看会把图挤出去（实测踩过）。挑中的图挂在**它到来的那一轮**上。
    */
-  pendingImages(
-    groupOpenid: string,
-    senderId: string,
-    maxImages = this.cfg.IMG_CONTEXT_MAX_COUNT,
-    maxAgeMinutes = this.cfg.IMG_CONTEXT_MAX_AGE_MINUTES,
-  ): PendingImage[] {
-    if (!this.cfg.HISTORY_ENABLED || groupOpenid === "" || senderId === "" || maxImages <= 0) return [];
-    const cutoff = Date.now() - maxAgeMinutes * 60_000;
-    const pending: PendingImage[] = [];
-    const seen = new Set<string>();
-    for (const entry of [...this.fresh(this.byGroup.get(groupOpenid) ?? [])].reverse()) {
-      if (entry.senderId !== senderId) continue;
-      // 这一条里的图已经喂过了（模型看过并答复过）→ 整条跳过，不要再当成新截图。
-      if (entry.imagesAnsweredAt !== undefined) continue;
-      if (entry.at < cutoff) continue;
-      for (const url of entry.imageUrls ?? []) {
-        if (seen.has(url)) continue;
-        seen.add(url);
-        pending.push({ url, at: entry.at });
-        if (pending.length >= maxImages) return pending;
-      }
+  render(groupOpenid: string, options: RenderOptions = {}): RenderedHistory {
+    if (!this.cfg.HISTORY_ENABLED || groupOpenid === "") return { turns: [], dropped: 0 };
+    const entries = this.injectable(groupOpenid);
+    const windowed = entries.slice(-this.cfg.HISTORY_MAX_ENTRIES);
+    const picked = pickImages(windowed, options.speakerId, this.cfg.IMG_CONTEXT_MAX_COUNT);
+
+    const turns: HistoryTurn[] = windowed.map((entry) => ({
+      role: entry.role,
+      images: (entry.imageUrls ?? []).filter((url) => picked.has(url)),
+      text: line(entry, this.cfg.CONTEXT_MESSAGE_MAX_CHARS),
+    }));
+
+    // 字符预算：从最新往前留，超了就**整轮**丢掉。
+    // 不能像切字符串那样从中间切——切开会让「回答」和它的「提问」分家，模型会看到一个没有前因的答复。
+    const kept: HistoryTurn[] = [];
+    let used = 0;
+    for (let i = turns.length - 1; i >= 0; i -= 1) {
+      const turn = turns[i]!;
+      if (kept.length > 0 && used + turn.text.length > this.cfg.CONTEXT_MAX_CHARS) break;
+      used += turn.text.length;
+      kept.unshift(turn);
     }
-    return pending;
-  }
 
-  /**
-   * 记下「这些图已经喂给模型了」，之后不再重复注入。
-   *
-   * 由调用方在**真正喂成功之后**调用（下载失败的不标记，下次还能重试）。
-   * 既覆盖从缓冲里翻出来的图，也覆盖当前消息自带的图——后者这一轮就已经被答复，
-   * 下一轮再当新证据就是灾难。
-   */
-  markImagesAnswered(groupOpenid: string, urls: string[]): void {
-    if (!this.cfg.HISTORY_ENABLED || groupOpenid === "" || urls.length === 0) return;
-    const wanted = new Set(urls);
-    const entries = this.byGroup.get(groupOpenid);
-    if (entries === undefined) return;
-    const now = Date.now();
-    let changed = false;
-    for (const entry of entries) {
-      if (entry.imagesAnsweredAt !== undefined) continue;
-      if (!(entry.imageUrls ?? []).some((url) => wanted.has(url))) continue;
-      entry.imagesAnsweredAt = now;
-      changed = true;
-    }
-    if (changed) this.scheduleSave();
-  }
-
-  /** 渲染成本轮可注入的上下文文本；不含当前这条消息。 */
-  render(groupOpenid: string): string {
-    if (!this.cfg.HISTORY_ENABLED || groupOpenid === "") return "";
-    const entries = this.injectable(groupOpenid).slice(-this.cfg.HISTORY_MAX_ENTRIES);
-    if (entries.length === 0) return "";
-    return this.lines(entries);
-  }
-
-  /**
-   * 机器人自己最近的回复，用于和平台上下文合并。
-   *
-   * 平台的上下文附件覆盖不到机器人自己说过的话（纯 @ 消息根本不带附件），
-   * 缺了它就会出现「上一轮已经答过、这一轮又从头答一遍」。所以用平台上下文时把它补在后面。
-   * `alreadyVisible` 传平台文本，已经写在里面的话不再重复。
-   */
-  recentBotReplies(groupOpenid: string, alreadyVisible: string): string[] {
-    if (!this.cfg.HISTORY_ENABLED || groupOpenid === "") return [];
-    return this.injectable(groupOpenid)
-      .filter((entry) => entry.role === "bot")
-      .slice(-this.cfg.HISTORY_MAX_ENTRIES)
-      .filter((entry) => entry.content.trim() !== "" && !alreadyVisible.includes(entry.content.trim()))
-      .map((entry) => this.line(entry));
+    return { turns: kept, dropped: entries.length - kept.length };
   }
 
   async flush(): Promise<void> {
@@ -171,27 +133,19 @@ export class History {
     if (this.dirty) await this.writeEntries();
   }
 
-  /** 本轮可注入的条目：先按存储窗口瘦身，再收窄到「注入回看多少分钟」。 */
+  /**
+   * 本会话里可以用上的条目。
+   *
+   * 会话边界就是「闲置」：超过 `HISTORY_INJECT_MINUTES` 分钟没说话就当作新会话——
+   * 这是各家对话平台的通行约定（Dialogflow CX 默认 30 分钟、Rasa 60 分钟、Amazon Lex 5 分钟）。
+   * 存储窗口另有 6 小时，是为了留下记录，不是为了喂给模型：太旧的话题已经翻篇，喂进去只会串台。
+   */
   private injectable(groupOpenid: string): HistoryEntry[] {
     const cutoff = Date.now() - this.cfg.HISTORY_INJECT_MINUTES * 60_000;
     return this.fresh(this.byGroup.get(groupOpenid) ?? []).filter((entry) => entry.at >= cutoff);
   }
 
-  private line(entry: HistoryEntry): string {
-    const who = entry.role === "bot" ? "客服" : `用户${entry.senderName ?? ""}`;
-    const text = truncateText(entry.content.replace(/\s+/g, " ").trim(), this.cfg.CONTEXT_MESSAGE_MAX_CHARS);
-    return `[${hhmm(entry.at)}] ${who}: ${text}`;
-  }
-
-  private lines(entries: HistoryEntry[]): string {
-    let text = entries.map((entry) => this.line(entry)).join("\n");
-    if (text.length > this.cfg.CONTEXT_MAX_CHARS) {
-      text = `（更早的记录已省略）\n${text.slice(-this.cfg.CONTEXT_MAX_CHARS)}`;
-    }
-    return text;
-  }
-
-  /** 按时间窗过滤，并按「存储上限」截取最新的一批；注入时再收窄到 HISTORY_MAX_ENTRIES。 */
+  /** 按时间窗过滤，并按「存储上限」截取最新的一批。 */
   private fresh(entries: HistoryEntry[]): HistoryEntry[] {
     const cutoff = Date.now() - this.cfg.HISTORY_WINDOW_MINUTES * 60_000;
     return entries.filter((entry) => entry.at >= cutoff).slice(-this.cfg.HISTORY_MAX_STORED);
@@ -222,8 +176,39 @@ export class History {
   }
 }
 
-/** 东八区的 HH:mm（缓冲行与「这张图什么时候发的」标注共用）。 */
-export function hhmm(ts: number): string {
+/** 挑出本轮要喂的图片 URL：只取当前提问者的，最新的优先，最多 `max` 张。 */
+function pickImages(entries: HistoryEntry[], speakerId: string | undefined, max: number): Set<string> {
+  const picked = new Set<string>();
+  if (!speakerId || max <= 0) return picked;
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const entry = entries[i]!;
+    if (entry.senderId !== speakerId) continue;
+    for (const url of entry.imageUrls ?? []) {
+      if (picked.size >= max) return picked;
+      picked.add(url);
+    }
+  }
+  return picked;
+}
+
+/**
+ * 渲染一行。
+ *
+ * user 轮带 `[HH:mm] 用户<昵称>: ` 前缀：群里多个同学共用一份上下文，靠前缀区分谁说的，
+ * 时间戳用来判断「这是不是很久以前的旧消息」。发言人用前缀而不是 messages 的 `name` 字段，
+ * 是因为实测 DeepSeek 与 GLM 都接受 `name` 却不生效（不报错，也不影响归属判断）。
+ *
+ * assistant 轮**不加**前缀：加了模型会照着自己历史的格式，在给用户的回复里也带上时间戳
+ * （实测出现过「[16:12] 好嘞，搞定就行喵~」）。
+ */
+function line(entry: HistoryEntry, maxChars: number): string {
+  const text = truncateText(entry.content.replace(/\s+/g, " ").trim(), maxChars);
+  if (entry.role === "bot") return text;
+  return `[${hhmm(entry.at)}] 用户${entry.senderName ?? ""}: ${text}`;
+}
+
+/** 东八区的 HH:mm。 */
+function hhmm(ts: number): string {
   const date = new Date(ts + 8 * 3_600_000);
   return `${String(date.getUTCHours()).padStart(2, "0")}:${String(date.getUTCMinutes()).padStart(2, "0")}`;
 }
