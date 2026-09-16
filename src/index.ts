@@ -52,6 +52,11 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
   log.info("boot", `启动完成：模型 ${cfg.LLM_MODEL} @ ${cfg.LLM_BASE_URL}（出站长连接，无监听端口）`);
+  log.info(
+    "boot",
+    `生成参数：max_tokens=${cfg.LLM_MAX_TOKENS}，思考档位=${cfg.LLM_REASONING_EFFORT}（none = 关闭思考；` +
+      `推理内容计入 max_tokens，关掉可避免正文被推理挤空）`,
+  );
   await bot.start(controller.signal);
   bot.stop();
   maintenance.stop();

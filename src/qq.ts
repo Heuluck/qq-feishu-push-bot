@@ -11,6 +11,7 @@ import type { Config } from "./config.js";
 import { splitContextAttachments } from "./context.js";
 import { dumpRawEvent } from "./debugDump.js";
 import type { FeedbackForwarder } from "./forward.js";
+import { hhmm } from "./history.js";
 import type { History } from "./history.js";
 import type { Limits } from "./limits.js";
 import type { LlmClient } from "./llm.js";
@@ -60,6 +61,38 @@ export const PLATFORM_CONTEXT_LABEL =
   "[对话上下文] 这条消息之前群里的最近几条消息（含机器人此前的回复，可能含其他成员的消息与附件）：";
 export const LOCAL_CONTEXT_LABEL =
   "[近期对话记录] 本机器人记录的本群最近交互（用户 @ 消息与机器人的回复），按时间从早到晚：";
+export const OWN_REPLIES_LABEL =
+  "[机器人自己说过的话] 平台给的上下文里没有这一段，由本机器人补记，用来避免重复回答已经答过的问题：";
+
+/** 本轮图片的来源，写进提示词让模型知道每张图是新的还是翻出来的旧图。 */
+const IMAGE_ORIGINS = {
+  message: "来自当前这条消息",
+  quote: "来自被引用的那条消息",
+  history: (at: number): string => `是该用户 ${hhmm(at)} 发在群里的历史图片`,
+  context: "来自平台给的上下文",
+} as const;
+
+/** 本轮要喂的一张图 + 它在提示词里的来源说明。 */
+interface TurnImage extends PreparedImage {
+  origin: string;
+}
+
+/**
+ * 向模型交代本轮图片的来源与时间。
+ *
+ * 只说「有图」不够：实测模型会把从上下文里翻出来的旧截图当成当前消息的新证据——
+ * 用户已经说「已经改好了」（话题是补卡），模型手里那张 25 分钟前的崩溃截图还在，
+ * 于是回了「看你发的截图还是会弹严重错误崩溃」，并因此误转交了一次人工。
+ * 全是当前消息自带的图时不必解释，那是默认理解，说了只是噪音。
+ */
+export function imageNotes(images: TurnImage[]): string {
+  if (images.length === 0 || images.every((image) => image.origin === IMAGE_ORIGINS.message)) return "";
+  const describes = images.map((image, index) => `第 ${index + 1} 张${image.origin}`);
+  return (
+    `【本轮图片】共 ${images.length} 张，按顺序：${describes.join("；")}。` +
+    "不是来自当前这条消息的图可能已经答复过，只在确实与当前问题相关时才作为依据。"
+  );
+}
 
 export function buildUserText(args: {
   question: string;
@@ -69,6 +102,8 @@ export function buildUserText(args: {
   skippedImages: number;
   /** 今天的读图额度已用完：要照常回答文字问题，但明确告诉用户图看不了了。 */
   imageQuotaExhausted?: boolean;
+  /** 本轮图片的来源与时间说明（见 {@link imageNotes}）。 */
+  imageNote?: string;
 }): string {
   const lines: string[] = [];
   if (args.senderName) lines.push(`（发送者：${args.senderName}）`);
@@ -85,6 +120,7 @@ export function buildUserText(args: {
     );
   }
   lines.push(args.question !== "" ? `问题：${args.question}` : "问题：（无文字，见下面的上下文或图片）");
+  if (args.imageNote) lines.push(args.imageNote);
   if (args.contextText) {
     lines.push(args.contextLabel ?? PLATFORM_CONTEXT_LABEL);
     lines.push(args.contextText);
@@ -206,12 +242,24 @@ export function createQqBot(deps: QqDeps): QQBot {
             maxPerMessage: cfg.CONTEXT_MESSAGE_MAX_CHARS,
           })
         : { text: "", imageUrls: [] as string[], truncated: false };
-      // 平台给了上下文就用平台的（它还能看到非 @ 消息与图片），没给就退回本地缓冲。
+      // 平台给了上下文就用平台的（它还能看到非 @ 消息与图片），同时不能丢机器人自己说过的话：
+      // 平台那段附件覆盖不到机器人自己的回复，缺了它就会出现「上一轮已经答过、这一轮又从头答一遍」。
       const localContext = history.render(msg.groupOpenid ?? "");
       const usePlatform = platformContext.text !== "";
-      const contextText = usePlatform ? platformContext.text : localContext;
+      const ownReplies = usePlatform ? history.recentBotReplies(msg.groupOpenid ?? "", platformContext.text) : [];
+      const contextText = usePlatform
+        ? [platformContext.text, ownReplies.length > 0 ? `${OWN_REPLIES_LABEL}\n${ownReplies.join("\n")}` : ""]
+            .filter((part) => part !== "")
+            .join("\n")
+        : localContext;
       const contextLabel = usePlatform ? PLATFORM_CONTEXT_LABEL : LOCAL_CONTEXT_LABEL;
-      const contextSource = usePlatform ? "平台" : localContext !== "" ? "本地缓冲" : "无";
+      const contextSource = usePlatform
+        ? ownReplies.length > 0
+          ? `平台+自记回复 ${ownReplies.length} 条`
+          : "平台"
+        : localContext !== ""
+          ? "本地缓冲"
+          : "无";
       const question = truncateText((msg.content ?? "").trim(), cfg.QUESTION_MAX_CHARS);
       const attachments: InboundAttachment[] = msg.attachments ?? [];
       const hasImage = attachments.some((att) => att.content_type?.startsWith("image/"));
@@ -255,7 +303,7 @@ export function createQqBot(deps: QqDeps): QQBot {
       // 图片配额有两层：单次上限（消息/引用 2 张、上下文 5 张）与单用户每日读取上限。
       // 每日额度用完时不读图，但仍然回答文字问题，并在提示里说明额度已用完。
       const dailyBudget = limits.imageBudget(msg.senderId);
-      const images: PreparedImage[] = [];
+      const images: TurnImage[] = [];
       const slotsLeft = (): number => dailyBudget - images.length;
 
       const prepared = await prepareImages(attachments, cfg, Math.min(cfg.IMG_MAX_COUNT, slotsLeft()));
@@ -266,37 +314,44 @@ export function createQqBot(deps: QqDeps): QQBot {
           .slice(0, cfg.IMG_MAX_COUNT)
           .map((att) => normalizeUrl(att.url)),
       );
-      const takeNew = (urls: string[], slots: number): string[] => {
-        const picked: string[] = [];
-        for (const url of urls) {
-          const key = normalizeUrl(url);
-          if (usedUrls.has(key)) continue;
-          usedUrls.add(key);
-          picked.push(url);
-          if (picked.length >= slots) break;
-        }
-        return picked;
-      };
 
-      images.push(...prepared.images);
+      // 同一个 URL 只取一次：同一张图可能同时出现在多个来源里，重复喂等于白花钱。
+      // 各来源的张数上限由各自的 prepareImageUrls 负责，这里只管去重。
+      const takeNew = (urls: string[]): string[] =>
+        urls.filter((url) => {
+          const key = normalizeUrl(url);
+          if (usedUrls.has(key)) return false;
+          usedUrls.add(key);
+          return true;
+        });
+
+      images.push(...prepared.images.map((image) => ({ ...image, origin: IMAGE_ORIGINS.message })));
       const quoteSlots = Math.max(0, Math.min(cfg.IMG_MAX_COUNT - images.length, slotsLeft()));
-      const quoteCandidates = quoteSlots > 0 ? takeNew(quotedImages, quoteSlots) : [];
+      const quoteCandidates = quoteSlots > 0 ? takeNew(quotedImages) : [];
       const fromQuote = await prepareImageUrls(quoteCandidates, cfg, quoteSlots);
-      images.push(...fromQuote);
+      images.push(...fromQuote.map((image) => ({ ...image, origin: IMAGE_ORIGINS.quote })));
 
       // 「用户先发截图、再 @ 提问」时，截图只存在于缓冲里：按「该用户最近的图」找，
       // 不受消息条数限制（中间夹了别人的消息也能找到），最多 IMG_CONTEXT_MAX_COUNT 张。
+      // 已经答复过、或超过 IMG_CONTEXT_MAX_AGE_MINUTES 分钟的图不再带上——见 pendingImages。
       const historySlots = Math.max(0, Math.min(cfg.IMG_CONTEXT_MAX_COUNT, slotsLeft()));
-      const historyCandidates =
-        historySlots > 0 ? takeNew(history.recentImageUrls(msg.groupOpenid ?? "", msg.senderId), historySlots) : [];
+      const pendingImages =
+        historySlots > 0 ? history.pendingImages(msg.groupOpenid ?? "", msg.senderId, historySlots) : [];
+      // 按 URL 回查每张图是什么时候发的，交给 imageNotes 写进提示词。
+      const sentAt = new Map(pendingImages.map((item) => [item.url, item.at]));
+      const historyCandidates = takeNew(pendingImages.map((item) => item.url));
       const fromHistory = await prepareImageUrls(historyCandidates, cfg, historySlots);
-      images.push(...fromHistory);
+      images.push(
+        ...fromHistory.map((image) => ({
+          ...image,
+          origin: IMAGE_ORIGINS.history(sentAt.get(image.url) ?? Date.now()),
+        })),
+      );
 
       const contextSlots = Math.max(0, Math.min(cfg.IMG_MAX_COUNT, slotsLeft()));
-      const contextCandidates =
-        contextSlots > 0 && usePlatform ? takeNew(platformContext.imageUrls, contextSlots) : [];
+      const contextCandidates = contextSlots > 0 && usePlatform ? takeNew(platformContext.imageUrls) : [];
       const fromContext = await prepareImageUrls(contextCandidates, cfg, contextSlots);
-      images.push(...fromContext);
+      images.push(...fromContext.map((image) => ({ ...image, origin: IMAGE_ORIGINS.context })));
 
       const imageCandidates =
         prepared.total + quotedImages.length + historyCandidates.length + platformContext.imageUrls.length;
@@ -326,7 +381,14 @@ export function createQqBot(deps: QqDeps): QQBot {
             }
           : {}),
       });
+      // 这一轮真正喂进去的图都记成「已答复」，下一轮不再重复注入（见 History.pendingImages）。
+      // 必须在 record 之后调用：当前这条消息刚记进去，它自带的图也要一起标记。
+      history.markImagesAnswered(
+        msg.groupOpenid ?? "",
+        images.map((image) => image.url),
+      );
 
+      const note = imageNotes(images);
       const result = await llm.complete(
         {
           userText: buildUserText({
@@ -336,6 +398,7 @@ export function createQqBot(deps: QqDeps): QQBot {
             senderName: msg.senderName,
             skippedImages,
             ...(quotaExhausted ? { imageQuotaExhausted: true } : {}),
+            ...(note !== "" ? { imageNote: note } : {}),
           }),
           images: images.map((image) => image.dataUrl),
           tool: FORWARD_FEEDBACK_TOOL,

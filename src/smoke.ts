@@ -13,7 +13,7 @@ import { History } from "./history.js";
 import { loadKnowledgeBase } from "./kb.js";
 import { Limits } from "./limits.js";
 import { prepareImageUrls, quotedImageUrls, resizeImageBuffer } from "./media.js";
-import { buildUserText, ensureQuotaNotice, splitReply } from "./qq.js";
+import { buildUserText, ensureQuotaNotice, imageNotes, splitReply } from "./qq.js";
 import { FILE_PATTERNS, dayKey, migrateLegacyForwards, monthKey, pruneByAge, stampKey } from "./retention.js";
 import { stripMentions, truncateText } from "./text.js";
 import { extractTextToolCalls, runTextToolCalls } from "./toolmarkup.js";
@@ -70,7 +70,9 @@ check(
 );
 check(
   "知识库：版本号只写一处，两条下载相关正文都带上",
-  (kb.systemPrompt.match(/当前版本 5\.16\.0/g) ?? []).length === 2,
+  // 只数「5.16.0」本身：两条正文的措辞不同（一条写「当前版本 {{...}}」、一条只写「（{{...}}）」），
+  // 按「当前版本 5.16.0」去数只会命中一条。
+  (kb.systemPrompt.match(/5\.16\.0/g) ?? []).length === 2,
 );
 
 const nestedKb = loadKnowledgeBase(
@@ -405,9 +407,11 @@ const historyCfg = {
   DATA_DIR: "data/smoke-tmp/history",
   HISTORY_ENABLED: true,
   HISTORY_WINDOW_MINUTES: 360,
+  HISTORY_INJECT_MINUTES: 60,
   HISTORY_MAX_ENTRIES: 10,
   HISTORY_MAX_STORED: 50,
   IMG_CONTEXT_MAX_COUNT: 5,
+  IMG_CONTEXT_MAX_AGE_MINUTES: 30,
   CONTEXT_MESSAGE_MAX_CHARS: 600,
   CONTEXT_MAX_CHARS: 3000,
 } as unknown as Config;
@@ -465,6 +469,9 @@ disabled.record("G1", { at: Date.now(), role: "user", content: "不该被记录"
 check("缓冲：开关关闭后不记录也不注入", disabled.render("G1") === "");
 
 // 缓冲里的图片：「用户先发截图、再 @ 提问」时把图喂给模型，且只取同一个用户发的
+const urls = (group: string, sender: string, max?: number, ageMinutes?: number): string[] =>
+  history.pendingImages(group, sender, max, ageMinutes).map((item) => item.url);
+
 history.record("G6", { at: Date.now() - 60_000, role: "user", senderId: "U1", content: "（发了图片）", imageUrls: ["https://x/old.png"] });
 history.record("G6", { at: Date.now() - 45_000, role: "user", senderId: "U2", content: "（发了图片）", imageUrls: ["https://x/other.png"] });
 history.record("G6", { at: Date.now() - 30_000, role: "user", senderId: "U1", content: "发生什么了啊" });
@@ -472,11 +479,39 @@ history.record("G6", { at: Date.now(), role: "user", senderId: "U1", content: "�
 history.record("G6", { at: Date.now(), role: "user", senderId: "U1", content: "（发了图片）", imageUrls: ["https://x/new.png"] });
 check(
   "缓冲图片：只取同一用户发的图（别人发的排除）",
-  JSON.stringify(history.recentImageUrls("G6", "U1", 5)) === JSON.stringify(["https://x/new.png", "https://x/old.png"]),
+  JSON.stringify(urls("G6", "U1", 5)) === JSON.stringify(["https://x/new.png", "https://x/old.png"]),
   "U2 的 other.png 未出现、重复的 new.png 只出现一次",
 );
-check("缓冲图片：受张数上限约束", history.recentImageUrls("G6", "U1", 1).length === 1);
-check("缓冲图片：开关关闭后不返回", disabled.recentImageUrls("G6", "U1").length === 0);
+check("缓冲图片：受张数上限约束", urls("G6", "U1", 1).length === 1);
+check("缓冲图片：开关关闭后不返回", disabled.pendingImages("G6", "U1").length === 0);
+check(
+  "缓冲图片：带出该图的发送时间（提示词要标注「什么时候发的」）",
+  (() => {
+    const first = history.pendingImages("G6", "U1", 5)[0];
+    return first !== undefined && Math.abs(first.at - Date.now()) < 5_000;
+  })(),
+);
+
+// 已答复过的图不再重复注入 —— 这是实测踩过的坑：用户已经说「已经改好了」，
+// 模型手里还挂着 25 分钟前的崩溃截图，于是回「看你发的截图还是会弹严重错误崩溃」并误转交人工。
+history.markImagesAnswered("G6", ["https://x/new.png"]);
+check(
+  "缓冲图片：已答复过的图不再重复注入",
+  JSON.stringify(urls("G6", "U1", 5)) === JSON.stringify(["https://x/old.png"]),
+  "new.png 已被标记为答复过",
+);
+check(
+  "缓冲图片：未答复的图不受影响（下载失败的那次不算答复，下次还能重试）",
+  urls("G6", "U1", 5).includes("https://x/old.png"),
+);
+
+// 时效：截图是有时效的证据，太旧的不能再当成「这次的新截图」
+history.record("G8", { at: Date.now() - 25 * 60_000, role: "user", senderId: "U1", content: "（发了图片）", imageUrls: ["https://x/stale.png"] });
+check(
+  "缓冲图片：超过时效的图不再注入",
+  urls("G8", "U1", 5, 30).length === 1 && urls("G8", "U1", 5, 10).length === 0,
+  "30 分钟内的给、10 分钟前的不给",
+);
 
 // 回归：图后面又聊了好几句（含别人插话），仍要能找到该用户的图 —— 不能按「最近 N 条消息」找
 history.record("G7", { at: Date.now() - 90_000, role: "user", senderId: "U1", content: "（发了图片）", imageUrls: ["https://x/shot.png"] });
@@ -485,9 +520,57 @@ for (let i = 0; i < 6; i += 1) {
 }
 check(
   "缓冲图片：中间夹着别人的消息也能找到该用户的图",
-  JSON.stringify(history.recentImageUrls("G7", "U1")) === JSON.stringify(["https://x/shot.png"]),
+  JSON.stringify(urls("G7", "U1")) === JSON.stringify(["https://x/shot.png"]),
 );
-check("缓冲图片：默认上限取自 IMG_CONTEXT_MAX_COUNT", history.recentImageUrls("G7", "U1").length <= historyCfg.IMG_CONTEXT_MAX_COUNT);
+check("缓冲图片：默认上限取自 IMG_CONTEXT_MAX_COUNT", urls("G7", "U1").length <= historyCfg.IMG_CONTEXT_MAX_COUNT);
+
+// 注入窗口：存储留 6 小时，但注入只看最近 HISTORY_INJECT_MINUTES 分钟（太久以前的会串台）
+history.record("G9", { at: Date.now() - 90 * 60_000, role: "user", content: "一个半小时前聊过的旧话题" });
+history.record("G9", { at: Date.now() - 5 * 60_000, role: "user", content: "刚刚的问题" });
+check(
+  "缓冲：注入窗口比存储窗口紧（1.5 小时前的旧话题不注入）",
+  !history.render("G9").includes("旧话题") && history.render("G9").includes("刚刚的问题"),
+);
+
+// 机器人自己说过的话：平台上下文覆盖不到它，用平台上下文时要补上，避免重复回答
+history.record("G10", { at: Date.now() - 120_000, role: "user", senderName: "Heuluck", content: "怎么崩了啊" });
+history.record("G10", { at: Date.now() - 110_000, role: "bot", content: "是 5.14.0 旧版的问题，先换成 5.16.0。" });
+history.record("G10", { at: Date.now() - 100_000, role: "user", senderName: "Luck", content: "我也有这个问题" });
+const ownReplies = history.recentBotReplies("G10", "=== 消息 1 ===\n[消息内容] 怎么崩了啊");
+check(
+  "自记回复：平台上下文没有机器人自己的话时补上",
+  ownReplies.length === 1 && ownReplies[0]!.includes("先换成 5.16.0"),
+  ownReplies.join(" | "),
+);
+check(
+  "自记回复：平台文本里已经出现过的回复不重复带上",
+  history.recentBotReplies("G10", "是 5.14.0 旧版的问题，先换成 5.16.0。").length === 0,
+);
+check("自记回复：只取机器人的话，不含用户消息", !ownReplies.join("").includes("怎么崩了啊"));
+
+// 图片来源说明：全是当前消息自带的图时不必解释，翻出来的旧图要写明来源与时间
+const noteMixed = imageNotes([
+  { dataUrl: "", url: "https://x/a.png", bytes: 1, origin: "来自当前这条消息" },
+  { dataUrl: "", url: "https://x/b.png", bytes: 1, origin: `是该用户 15:08 发在群里的历史图片` },
+]);
+check(
+  "图片说明：混有历史图片时写明来源与时间",
+  noteMixed.includes("第 1 张来自当前这条消息") &&
+    noteMixed.includes("第 2 张是该用户 15:08 发在群里的历史图片") &&
+    noteMixed.includes("可能已经答复过"),
+  noteMixed,
+);
+check(
+  "图片说明：全是当前消息的图时不啰嗦",
+  imageNotes([{ dataUrl: "", url: "https://x/a.png", bytes: 1, origin: "来自当前这条消息" }]) === "" &&
+    imageNotes([]) === "",
+);
+check(
+  "用户消息组装：图片来源说明写进提示词",
+  buildUserText({ question: "还是崩", senderName: "小明", skippedImages: 0, imageNote: noteMixed }).includes(
+    "【本轮图片】",
+  ),
+);
 
 // 10. 正文形态的工具调用（真实泄漏样本）
 const leaked = `版本号我可能记岔了，同学以 App「关于」页显示的为准——显示 5.16.0 那就不是旧版喵。

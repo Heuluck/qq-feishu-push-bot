@@ -43,6 +43,20 @@ export class LlmClient {
   }
 
   /**
+   * 思考档位参数。`default` 表示一个都不带、用厂商默认值。
+   *
+   * 默认档位由 `LLM_REASONING_EFFORT` 决定（默认 `none`，即关掉思考）：
+   * 推理内容计入 `max_tokens`，DeepSeek 在「读一张报错截图」这类任务上能让 reasoning
+   * 吃光整个预算，返回空正文——于是 `askForReply` 再要一次，而它用的是同一个预算。
+   *
+   * 两处请求都要带上：补答那次如果关掉思考而这里开着，就会重演同一个问题。
+   */
+  private thinkingParams(): { reasoning_effort?: Exclude<Config["LLM_REASONING_EFFORT"], "default"> } {
+    const effort = this.cfg.LLM_REASONING_EFFORT;
+    return effort === "default" ? {} : { reasoning_effort: effort };
+  }
+
+  /**
    * 请求结构刻意做成「静态前缀 + 单个动态消息」：
    *   [system: 规则 + 知识库]  → 逐字节稳定，命中厂商前缀缓存
    *   [user: 本次提问 + 图片]  → 每次唯一，只有它按原价计费
@@ -71,6 +85,7 @@ export class LlmClient {
           tools: [input.tool],
           tool_choice: "auto",
           max_tokens: this.cfg.LLM_MAX_TOKENS,
+          ...this.thinkingParams(),
         },
         { signal: deadline },
       );
@@ -153,6 +168,7 @@ export class LlmClient {
           tools: [tool],
           tool_choice: "auto",
           max_tokens: this.cfg.LLM_MAX_TOKENS,
+          ...this.thinkingParams(),
         },
         { signal },
       );

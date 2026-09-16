@@ -21,6 +21,8 @@ export function quotedImageUrls(attachments: QuotedAttachment[] | undefined): st
 
 export interface PreparedImage {
   dataUrl: string;
+  /** 来源 URL（原始形态，未补协议）。调用方靠它回溯这张图是从哪儿来的。 */
+  url: string;
   width?: number;
   height?: number;
   bytes: number;
@@ -107,6 +109,7 @@ export async function prepareImageUrls(urls: string[], cfg: Config, max = cfg.IM
       const meta = await sharp(prepared.data).metadata();
       images.push({
         dataUrl: `data:${prepared.mime};base64,${prepared.data.toString("base64")}`,
+        url,
         width: meta.width,
         height: meta.height,
         bytes: prepared.data.byteLength,

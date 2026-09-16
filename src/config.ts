@@ -29,6 +29,18 @@ const EnvSchema = z.object({
   LLM_MODEL: z.string().trim().min(1).default("deepseek-flash"),
   LLM_MAX_TOKENS: z.coerce.number().int().min(64).max(8192).default(1024),
   LLM_DEADLINE_MS: z.coerce.number().int().min(5_000).max(120_000).default(45_000),
+  /**
+   * 思考（推理）档位，直接透传给 OpenAI 兼容端点的 `reasoning_effort`。
+   *
+   * 默认 `none`（关闭思考）。DeepSeek 的推理内容**计入 `LLM_MAX_TOKENS`**：实测让它
+   * 读一张报错截图，reasoning 能吃掉 1024 的全部预算，`finish_reason=length` 且
+   * `content` 为空——于是走 `askForReply` 兜底再要一次，而兜底用的是同一个预算，
+   * 可能再空一次。关掉之后同一张图 1.3 秒出结果、只花 88 token（原来要 4.8 秒且答不出来）。
+   *
+   * 换其他厂商时注意：GLM 的思考关不掉，只能填 `low` / `high` / `max`
+   * （填 `none` 会 400：该模型始终思考）；`default` 表示不带这个参数、用厂商默认值。
+   */
+  LLM_REASONING_EFFORT: z.enum(["none", "minimal", "low", "medium", "high", "max", "default"]).default("none"),
 
   // 图片
   /**
@@ -48,6 +60,14 @@ const EnvSchema = z.object({
    * 因此按「该用户最近的图」去找，而不是按「最近 N 条消息」去找。
    */
   IMG_CONTEXT_MAX_COUNT: z.coerce.number().int().min(0).max(20).default(5),
+  /**
+   * 缓冲里的图只回看最近多少分钟（默认 30）。
+   *
+   * 截图是有时效的证据：用户 25 分钟前发的那张崩溃截图，在「已经改好了」这一轮再喂给模型，
+   * 它会把旧图当成当前消息的新证据（实测就因此误转交了一次人工）。加上「已经答复过的图不再
+   * 重复注入」（见 `History.pendingImages`），两道一起挡住这种情况。
+   */
+  IMG_CONTEXT_MAX_AGE_MINUTES: z.coerce.number().int().min(1).max(1_440).default(30),
   /** 同一个用户每天最多读几张图（超出后仍回答文字问题，但会告知用户读图额度用完）。 */
   IMG_DAILY_LIMIT_PER_USER: z.coerce.number().int().min(1).max(1000).default(10),
 
@@ -65,8 +85,21 @@ const EnvSchema = z.object({
     .transform((value) => value === "true"),
   /** 本地对话缓冲保留多久（分钟），默认 6 小时。 */
   HISTORY_WINDOW_MINUTES: z.coerce.number().int().min(1).max(10_080).default(360),
-  /** 本地对话缓冲最多注入几条（默认最近 10 条）。 */
-  HISTORY_MAX_ENTRIES: z.coerce.number().int().min(1).max(100).default(10),
+  /**
+   * 注入时只回看最近多少分钟（默认 1 小时）。
+   *
+   * 与 `HISTORY_WINDOW_MINUTES`（存储窗口，6 小时）分开：存储要留久一点，
+   * 但注入太旧的内容会串台——群里半小时前聊的话题已经翻篇，再喂给模型只会干扰判断。
+   */
+  HISTORY_INJECT_MINUTES: z.coerce.number().int().min(1).max(10_080).default(60),
+  /**
+   * 本地对话缓冲最多注入几条（默认最近 30 条）。
+   *
+   * 条数是防刷屏的下限保护，真正的成本上限是 `CONTEXT_MAX_CHARS`。条数给小了会出问题：
+   * 实测一次两人交错的对话，10 条只覆盖几分钟，机器人自己刚说过的「先升到 5.16.0」
+   * 被挤出窗口，于是下一轮又把同一个问题从头答了一遍。
+   */
+  HISTORY_MAX_ENTRIES: z.coerce.number().int().min(1).max(100).default(30),
   /** 本地对话缓冲最多存放几条（只影响存储；留多一些，方便以后调大注入条数）。 */
   HISTORY_MAX_STORED: z.coerce.number().int().min(1).max(1000).default(50),
   /** 回复最多分成几条发送（QQ 对同一 msg_id 的被动回复条数有限，防御性设上限）。 */
