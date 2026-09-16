@@ -1,9 +1,17 @@
 services:
   bot:
+    # 显式指定镜像名：不写的话镜像名由目录名推导（incu-qq-bot-bot），
+    # 目录一改名就会让本地已有的镜像「找不到」而触发重新构建。
+    # 有 build: 兜底，所以本机没这个镜像时会自动构建。
+    image: incu-qq-bot:latest
     build: .
     container_name: incu-qq-bot
     restart: unless-stopped
     env_file: .env
+    # 非 root 运行。uid/gid 必须与宿主机部署账号一致，否则 bind mount 的 data/ 写不进去
+    # （权限不符会在启动时就报错，不会静默丢数据）。默认 1000 对应常见单用户主机；
+    # 服务器上填 `id -u` / `id -g` 的结果。别填成宿主机上另一个真实用户的 uid。
+    user: "${BOT_UID:-1000}:${BOT_GID:-1000}"
     # 无 ports：机器人只走出站连接，不需要暴露任何端口
     mem_limit: 320m
     volumes:

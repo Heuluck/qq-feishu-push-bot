@@ -1,0 +1,12 @@
+# 构建上下文里只留 Dockerfile 真正 COPY 的东西（package.json / tsconfig.json / src / kb）。
+# 下面这些既拖慢每次 build，又可能被送到远程 builder：
+# node_modules 127MB、data/ 是用户 openid 与问题原文、.env 是全部凭据。
+node_modules
+dist
+data
+.env
+.env.*
+!.env.example
+.git
+.DS_Store
+*.log
