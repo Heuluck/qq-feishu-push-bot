@@ -18,7 +18,7 @@ import { buildUserText, createSerialQueue, ensureQuotaNotice, platformBackground
 import { FILE_PATTERNS, dayKey, migrateLegacyForwards, monthKey, pruneByAge, stampKey } from "./retention.js";
 import { stripMentions, truncateText } from "./text.js";
 import { extractTextToolCalls, runTextToolCalls } from "./toolmarkup.js";
-import { FORWARD_FEEDBACK_TOOL, ForwardFeedbackArgs } from "./tools.js";
+import { FORWARD_FEEDBACK_TOOL, ForwardFeedbackArgs, SEND_FOLLOWUP_TOOL, SendFollowupArgs, createTurnTools } from "./tools.js";
 
 const cfg = {
   IMG_MAX_EDGE: 1280,
@@ -134,6 +134,54 @@ check(
 );
 check("工具参数：空 summary 拦截", !ForwardFeedbackArgs.safeParse({ summary: "", details: "x" }).success);
 check("工具参数：超长 details 拦截", !ForwardFeedbackArgs.safeParse({ summary: "x", details: "a".repeat(1600) }).success);
+
+// 2b. 补充消息工具（send_followup）：把「答案」和「已转交」分两条说
+check(
+  "补充消息：schema 生成",
+  (SEND_FOLLOWUP_TOOL.function.parameters as { properties?: Record<string, unknown> }).properties?.["message"] !== undefined,
+);
+check("补充消息：合法入参通过", SendFollowupArgs.safeParse({ message: "这条已经转给负责的同学了。" }).success);
+check("补充消息：空内容拦截", !SendFollowupArgs.safeParse({ message: "   " }).success);
+check("补充消息：超长拦截（600 字上限）", !SendFollowupArgs.safeParse({ message: "字".repeat(601) }).success);
+
+const fakeForwarder = {
+  push: async () => ({ ok: true, message: "已成功转交人工处理。" }),
+} as unknown as Parameters<typeof createTurnTools>[0];
+const turn = createTurnTools(fakeForwarder, { msgId: "m1", senderId: "u1" });
+const firstFollowup = await turn.exec("send_followup", JSON.stringify({ message: "这条也转给负责的同学了。" }));
+check(
+  "补充消息：第一条被记下（真正发出由调用方在主回复之后做）",
+  turn.followups.length === 1 && firstFollowup.text.includes("之后"),
+  firstFollowup.text,
+);
+const secondFollowup = await turn.exec("send_followup", JSON.stringify({ message: "再说一句。" }));
+check(
+  "补充消息：每轮最多一条——第二次调用不发出任何东西，并告知模型",
+  turn.followups.length === 1 && secondFollowup.text.includes("没有发出"),
+  secondFollowup.text,
+);
+
+const turn2 = createTurnTools(fakeForwarder, { msgId: "m1", senderId: "u1" });
+await turn2.exec("send_followup", "not json");
+check("补充消息：参数不合法时不占用那条配额（修正后还能用）", turn2.followups.length === 0);
+check(
+  "补充消息：修正后仍可正常发出",
+  (await turn2.exec("send_followup", JSON.stringify({ message: "好的。" }))).text.includes("已记下") &&
+    turn2.followups.length === 1,
+);
+
+const turn3 = createTurnTools(fakeForwarder, { msgId: "m1", senderId: "u1" });
+const forwardedOnce = await turn3.exec("forward_feedback", JSON.stringify({ summary: "用户甲要求转人工", details: "**现象** 甲要求转人工。" }));
+check("转交：仍走原来的路径", forwardedOnce.forwarded && turn3.followups.length === 0);
+check("未知工具仍然被挡", (await turn3.exec("delete_everything", "{}")).text.includes("未知工具"));
+
+check(
+  "提示词：告知了 send_followup 及其「每轮最多一次」的限制",
+  kb.systemPrompt.includes("send_followup") &&
+    kb.systemPrompt.includes("每轮最多调用一次") &&
+    kb.systemPrompt.includes("先发你的主回复"),
+);
+check("提示词：禁止在 details 里写「已回复」这类声明", kb.systemPrompt.includes("不要写「已回复」「已告知」这类声明"));
 
 // 3. 图片缩放
 const big = await sharp({
@@ -592,7 +640,7 @@ const built = buildMessages(
       { role: "assistant", parts: [{ text: "[15:08] 先换成 5.16.0" }] },
     ],
     userParts: [{ text: "问题：已经改好了" }, { image: "data:image/png;base64,BBB" }],
-    tool: fakeTool,
+    tools: [fakeTool],
     execTool: async () => ({ text: "", forwarded: false }),
   },
   "SYSTEM",
@@ -613,7 +661,7 @@ check(
 check(
   "多轮组装：只有一段文本的历史轮退化成字符串（更紧凑、利于前缀缓存）",
   buildMessages(
-    { history: [{ role: "user", parts: [{ text: "[15:07] 用户A: 你好" }] }], userParts: [{ text: "问题：在吗" }], tool: fakeTool, execTool: async () => ({ text: "", forwarded: false }) },
+    { history: [{ role: "user", parts: [{ text: "[15:07] 用户A: 你好" }] }], userParts: [{ text: "问题：在吗" }], tools: [fakeTool], execTool: async () => ({ text: "", forwarded: false }) },
     "S",
   )[1]!.content === "[15:07] 用户A: 你好",
 );
@@ -632,7 +680,7 @@ const toolHistory = [
     ],
   },
 ];
-const withTools = buildMessages({ history: toolHistory, userParts: [{ text: "问题：帮我转人工" }], tool: fakeTool, execTool: async () => ({ text: "", forwarded: false }) }, "S");
+const withTools = buildMessages({ history: toolHistory, userParts: [{ text: "问题：帮我转人工" }], tools: [fakeTool], execTool: async () => ({ text: "", forwarded: false }) }, "S");
 check(
   "多轮组装：历史工具轮还原成 assistant(tool_calls) + tool，位置在答复正文之前",
   withTools.map((m) => m.role).join(",") === "system,user,assistant,tool,assistant,user",
@@ -654,7 +702,7 @@ check(
 check(
   "多轮组装：没有工具调用的轮次不会凭空多出 tool 消息",
   buildMessages(
-    { history: [{ role: "assistant", parts: [{ text: "直接答复" }] }], userParts: [{ text: "问题：x" }], tool: fakeTool, execTool: async () => ({ text: "", forwarded: false }) },
+    { history: [{ role: "assistant", parts: [{ text: "直接答复" }] }], userParts: [{ text: "问题：x" }], tools: [fakeTool], execTool: async () => ({ text: "", forwarded: false }) },
     "S",
   ).map((m) => m.role).join(",") === "system,assistant,user",
 );

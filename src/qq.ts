@@ -18,10 +18,21 @@ import { log, qqLogger } from "./log.js";
 import { normalizeUrl, prepareImageUrls, prepareImages, quotedImageUrls } from "./media.js";
 import type { InboundAttachment, PreparedImage } from "./media.js";
 import { stripMentions, truncateText } from "./text.js";
-import { FORWARD_FEEDBACK_TOOL, createToolExecutor } from "./tools.js";
+import { FORWARD_FEEDBACK_TOOL, SEND_FOLLOWUP_TOOL, createTurnTools } from "./tools.js";
 
 /** 单条回复的分段长度。 */
 const MAX_REPLY_CHARS = 1600;
+
+/**
+ * 同一个 `msg_id` 最多能发几条被动回复。
+ *
+ * 官方文档（tencent-connect/bot-docs，send.md）按场景写明：群聊「被动消息（回复类）有效时间为 5 分钟，
+ * **每个消息最多回复 5 次**，超时或超频会发送（回复）失败」。注意是 5 分钟不是 60 分钟——
+ * 60 分钟那条是**单聊**的。同一 `msg_id` 下每条回复要用不同的 `msg_seq`（SDK 会自动填）。
+ *
+ * 因此主回复的分段数 + 补充消息要一起卡在这条线以内，否则最后几条会发不出去。
+ */
+const MAX_PASSIVE_REPLIES = 5;
 
 /**
  * 按 key 串行执行，后到的任务等前一个跑完。
@@ -383,16 +394,17 @@ export function createQqBot(deps: QqDeps): QQBot {
           : {}),
       });
 
+      const tools = createTurnTools(forwarder, {
+        msgId: msg.messageId,
+        senderId: msg.senderId,
+        exemptHourlyLimit: decision.isPrivileged,
+      });
       const result = await llm.complete(
         {
           history: historyTurns,
           userParts,
-          tool: FORWARD_FEEDBACK_TOOL,
-          execTool: createToolExecutor(forwarder, {
-            msgId: msg.messageId,
-            senderId: msg.senderId,
-            exemptHourlyLimit: decision.isPrivileged,
-          }),
+          tools: [FORWARD_FEEDBACK_TOOL, SEND_FOLLOWUP_TOOL],
+          execTool: tools.exec,
         },
         systemPrompt,
       );
@@ -405,8 +417,18 @@ export function createQqBot(deps: QqDeps): QQBot {
             : "呜……我暂时没找到答案，换个说法再问一次好不好喵~",
         quotaExhausted,
       );
-      for (const chunk of splitReply(reply, MAX_REPLY_CHARS, cfg.REPLY_MAX_CHUNKS)) {
+      // 有补充消息时先给它留一条：主回复的分段数 + 补充消息要一起落在平台那 5 条以内。
+      const maxMainChunks = Math.max(1, Math.min(cfg.REPLY_MAX_CHUNKS, MAX_PASSIVE_REPLIES - tools.followups.length));
+      for (const chunk of splitReply(reply, MAX_REPLY_CHARS, maxMainChunks)) {
         await bot.sendText(msg.replyTarget, chunk);
+      }
+      // 补充消息在主回复**之后**单独发出：模型用它把「答案」和「已转交」分开说，
+      // 免得两件事挤在一句里、或者干脆只留一句「已转交」。
+      for (const extra of tools.followups) {
+        log.info("qq", `补充消息：${extra.slice(0, 60)}`);
+        for (const chunk of splitReply(extra, MAX_REPLY_CHARS, 1)) {
+          await bot.sendText(msg.replyTarget, chunk);
+        }
       }
       // 回复与**这一轮做过的工具调用**都要进历史：前者让用户接着追问时模型知道自己说过什么，
       // 后者让它知道自己已经转过人工、转过谁——少了它就会出现同一个问题重复转交。

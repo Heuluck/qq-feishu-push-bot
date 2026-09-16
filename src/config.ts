@@ -96,7 +96,12 @@ const EnvSchema = z.object({
   HISTORY_MAX_ENTRIES: z.coerce.number().int().min(1).max(100).default(30),
   /** 本地对话缓冲最多存放几条（只影响存储；留多一些，方便以后调大注入条数）。 */
   HISTORY_MAX_STORED: z.coerce.number().int().min(1).max(1000).default(50),
-  /** 回复最多分成几条发送（QQ 对同一 msg_id 的被动回复条数有限，防御性设上限）。 */
+  /**
+   * 主回复最多分成几条发送。
+   *
+   * 平台限制是「同一个 `msg_id` 最多 5 条被动回复」（见 src/qq.ts 的 MAX_PASSIVE_REPLIES），
+   * 超出的部分会在发送时失败。有补充消息（send_followup）时，代码会先给它留出条数。
+   */
   REPLY_MAX_CHUNKS: z.coerce.number().int().min(1).max(10).default(3),
 
   // 频次与配额

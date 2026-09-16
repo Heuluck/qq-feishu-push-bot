@@ -33,7 +33,8 @@ export interface CompleteInput {
   history: LlmTurn[];
   /** 本轮提问的内容片段（文本 + 图片，按展示顺序）。 */
   userParts: MessagePart[];
-  tool: ChatCompletionTool;
+  /** 本轮可用的工具定义。个数与内容都必须稳定，否则会破坏请求前缀缓存。 */
+  tools: ChatCompletionTool[];
   execTool: ToolExecutor;
 }
 
@@ -116,7 +117,7 @@ export class LlmClient {
         {
           model: this.cfg.LLM_MODEL,
           messages,
-          tools: [input.tool],
+          tools: input.tools,
           tool_choice: "auto",
           max_tokens: this.cfg.LLM_MAX_TOKENS,
           ...this.thinkingParams(),
@@ -167,7 +168,7 @@ export class LlmClient {
     // 注意这里必须把工具一起传下去——不给工具时，上下文里「答不了就转交」的要求会让它
     // 只能把调用写成正文（这正是我们之前踩过的坑）。
     if (lastText === "") {
-      const fallback = await this.askForReply(messages, input.tool, input.execTool, deadline);
+      const fallback = await this.askForReply(messages, input.tools, input.execTool, deadline);
       lastText = fallback.text;
       if (fallback.forwarded) forwarded = true;
     }
@@ -191,7 +192,7 @@ export class LlmClient {
    */
   private async askForReply(
     messages: ChatCompletionMessageParam[],
-    tool: ChatCompletionTool,
+    tools: ChatCompletionTool[],
     execTool: ToolExecutor,
     signal: AbortSignal,
   ): Promise<{ text: string; forwarded: boolean }> {
@@ -207,7 +208,7 @@ export class LlmClient {
                 "（系统提示：请直接用一两句话回应用户。如果是因为你看不到上一条消息或缺少上文，就直接说明这一点，并请他把问题再发一次、或引用你上一条回复。）",
             },
           ],
-          tools: [tool],
+          tools,
           tool_choice: "auto",
           max_tokens: this.cfg.LLM_MAX_TOKENS,
           ...this.thinkingParams(),
