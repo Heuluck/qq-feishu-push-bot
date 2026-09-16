@@ -31,9 +31,25 @@ const EnvSchema = z.object({
   LLM_DEADLINE_MS: z.coerce.number().int().min(5_000).max(120_000).default(45_000),
 
   // 图片
-  IMG_MAX_EDGE: z.coerce.number().int().min(256).max(4096).default(1280),
+  /**
+   * 客户端缩放的长边上限。
+   *
+   * 依据 DeepSeek 视觉文档：每张图 token 上限 1024，且大于约 1300×1300 总像素（≈169 万）的图
+   * 都会被它内部缩到那个量级——也就是说缩得比这更狠只会白白丢掉截图里的文字细节，省不到钱
+   * （单图最多约 0.002 元）。1920 长边对应 1080×2400 手机截图 → 864×1920 ≈ 166 万像素，
+   * 正好落在它内部目标附近；再大的图（如相机原图）仍会被缩到这里，避免上传无谓的字节。
+   */
+  IMG_MAX_EDGE: z.coerce.number().int().min(256).max(4096).default(1920),
   IMG_MAX_COUNT: z.coerce.number().int().min(0).max(4).default(2),
   IMG_MAX_BYTES: z.coerce.number().int().min(1024).default(10 * 1024 * 1024),
+  /**
+   * 上下文（对话缓冲）里最多为该用户读几张图。
+   * 与 IMG_MAX_COUNT（单条消息自带的图）分开算：用户常常连发几张截图、中间还夹着别人的消息，
+   * 因此按「该用户最近的图」去找，而不是按「最近 N 条消息」去找。
+   */
+  IMG_CONTEXT_MAX_COUNT: z.coerce.number().int().min(0).max(20).default(5),
+  /** 同一个用户每天最多读几张图（超出后仍回答文字问题，但会告知用户读图额度用完）。 */
+  IMG_DAILY_LIMIT_PER_USER: z.coerce.number().int().min(1).max(1000).default(10),
 
   // 超长内容截断
   /** 用户单条提问最多保留多少字符（超出部分截断并标注）。 */

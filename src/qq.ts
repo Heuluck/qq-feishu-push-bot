@@ -15,8 +15,8 @@ import type { History } from "./history.js";
 import type { Limits } from "./limits.js";
 import type { LlmClient } from "./llm.js";
 import { log, qqLogger } from "./log.js";
-import { prepareImageUrls, prepareImages, quotedImageUrls } from "./media.js";
-import type { InboundAttachment } from "./media.js";
+import { normalizeUrl, prepareImageUrls, prepareImages, quotedImageUrls } from "./media.js";
+import type { InboundAttachment, PreparedImage } from "./media.js";
 import { stripMentions, truncateText } from "./text.js";
 import { FORWARD_FEEDBACK_TOOL, createToolExecutor } from "./tools.js";
 
@@ -67,16 +67,43 @@ export function buildUserText(args: {
   contextLabel?: string;
   senderName?: string;
   skippedImages: number;
+  /** 今天的读图额度已用完：要照常回答文字问题，但明确告诉用户图看不了了。 */
+  imageQuotaExhausted?: boolean;
 }): string {
   const lines: string[] = [];
   if (args.senderName) lines.push(`（发送者：${args.senderName}）`);
+  // 【必须告知】放在问题前面：这个位置模型更容易照做（实测放在末尾时转交场景会漏）。
+  // 约定标记的硬规则写在系统提示词里：出现这个标记，就必须把这句写进给用户的回复。
+  if (args.skippedImages > 0) {
+    lines.push(`【必须告知】另有 ${args.skippedImages} 张图片没能读取，请让用户重发或改用文字描述。`);
+  }
+  if (args.imageQuotaExhausted) {
+    lines.push(
+      "【必须告知】该用户今天的读图额度已经用完，这条消息里的图片没有被读取。" +
+        "回复里必须带上这句意思（可直接用这句话）：「今天图片额度用完了，图我没读到」——" +
+        "然后请他先用文字描述，或明天再发图。转交时也要写这句。",
+    );
+  }
   lines.push(args.question !== "" ? `问题：${args.question}` : "问题：（无文字，见下面的上下文或图片）");
   if (args.contextText) {
     lines.push(args.contextLabel ?? PLATFORM_CONTEXT_LABEL);
     lines.push(args.contextText);
   }
-  if (args.skippedImages > 0) lines.push(`（另有 ${args.skippedImages} 张图片未能读取）`);
   return lines.join("\n");
+}
+
+/** 读图额度用完时的固定告知句（模型漏说时由代码补上）。 */
+const QUOTA_NOTICE = "今天图片额度用完了，图我没读到，麻烦先用文字描述一下，或者明天再发图喵~";
+const QUOTA_MENTIONED = /额度|没读|读不了|读不到|明天再发图|明天再补/;
+
+/**
+ * 保证「读图额度用完」这件事一定被说出口。
+ * 提示词里已经立了硬规则、还给了可照抄的句子，但实测在「转交」场景仍有约 1/3 会漏
+ * （模型在工具调用之后只顾着写收尾话术），所以这里补一道确定性兜底：漏了就追加一句。
+ */
+export function ensureQuotaNotice(reply: string, quotaExhausted: boolean): string {
+  if (!quotaExhausted || QUOTA_MENTIONED.test(reply)) return reply;
+  return reply === "" ? QUOTA_NOTICE : `${reply}\n${QUOTA_NOTICE}`;
 }
 
 export interface QqDeps {
@@ -127,14 +154,20 @@ export function createQqBot(deps: QqDeps): QQBot {
         });
         if (m.kind !== "group") return;
         const text = (m.content ?? "").trim();
-        const hasImage = (m.attachments ?? []).some((att) => att.content_type?.startsWith("image/"));
-        const content = text !== "" ? text : hasImage ? "（发了图片）" : "";
+        const imageUrls = (m.attachments ?? [])
+          .filter((att) => att.content_type?.startsWith("image/") && typeof att.url === "string")
+          .map((att) => att.url);
+        // 图片 URL 一并记下来：用户常常先发一张截图、再 @ 机器人提问，
+        // 只有把图带上，模型才不会回答"截图我看不清"。
+        const content = text !== "" ? text : imageUrls.length > 0 ? "（发了图片）" : "";
         if (content === "") return;
         history.record(m.groupOpenid ?? "", {
           at: Date.now(),
           role: "user",
+          senderId: m.senderId,
           ...(m.senderName ? { senderName: m.senderName } : {}),
           content,
+          ...(imageUrls.length > 0 ? { imageUrls } : {}),
         });
       },
     }),
@@ -219,27 +252,79 @@ export function createQqBot(deps: QqDeps): QQBot {
       const modelQuestion = nothingAtAll ? "（用户只 @ 了你，没有说任何内容）" : question;
 
       const started = Date.now();
-      const prepared = await prepareImages(attachments, cfg);
-      // 图片配额按优先级分配：当前消息附件 → 引用的图片 → 平台上下文文本里的图片。
-      const slotsAfterMessage = Math.max(0, cfg.IMG_MAX_COUNT - prepared.images.length);
-      const fromQuote = slotsAfterMessage > 0 ? await prepareImageUrls(quotedImages, cfg, slotsAfterMessage) : [];
-      const slotsAfterQuote = Math.max(0, cfg.IMG_MAX_COUNT - prepared.images.length - fromQuote.length);
-      const fromContext =
-        slotsAfterQuote > 0 && usePlatform
-          ? await prepareImageUrls(platformContext.imageUrls, cfg, slotsAfterQuote)
-          : [];
-      const images = [...prepared.images, ...fromQuote, ...fromContext];
+      // 图片配额有两层：单次上限（消息/引用 2 张、上下文 5 张）与单用户每日读取上限。
+      // 每日额度用完时不读图，但仍然回答文字问题，并在提示里说明额度已用完。
+      const dailyBudget = limits.imageBudget(msg.senderId);
+      const images: PreparedImage[] = [];
+      const slotsLeft = (): number => dailyBudget - images.length;
+
+      const prepared = await prepareImages(attachments, cfg, Math.min(cfg.IMG_MAX_COUNT, slotsLeft()));
+      // 同一个 URL 只取一次：同一张图可能同时出现在多个来源里，重复喂等于白花钱。
+      const usedUrls = new Set(
+        attachments
+          .filter((att) => att.content_type?.startsWith("image/") && typeof att.url === "string")
+          .slice(0, cfg.IMG_MAX_COUNT)
+          .map((att) => normalizeUrl(att.url)),
+      );
+      const takeNew = (urls: string[], slots: number): string[] => {
+        const picked: string[] = [];
+        for (const url of urls) {
+          const key = normalizeUrl(url);
+          if (usedUrls.has(key)) continue;
+          usedUrls.add(key);
+          picked.push(url);
+          if (picked.length >= slots) break;
+        }
+        return picked;
+      };
+
+      images.push(...prepared.images);
+      const quoteSlots = Math.max(0, Math.min(cfg.IMG_MAX_COUNT - images.length, slotsLeft()));
+      const quoteCandidates = quoteSlots > 0 ? takeNew(quotedImages, quoteSlots) : [];
+      const fromQuote = await prepareImageUrls(quoteCandidates, cfg, quoteSlots);
+      images.push(...fromQuote);
+
+      // 「用户先发截图、再 @ 提问」时，截图只存在于缓冲里：按「该用户最近的图」找，
+      // 不受消息条数限制（中间夹了别人的消息也能找到），最多 IMG_CONTEXT_MAX_COUNT 张。
+      const historySlots = Math.max(0, Math.min(cfg.IMG_CONTEXT_MAX_COUNT, slotsLeft()));
+      const historyCandidates =
+        historySlots > 0 ? takeNew(history.recentImageUrls(msg.groupOpenid ?? "", msg.senderId), historySlots) : [];
+      const fromHistory = await prepareImageUrls(historyCandidates, cfg, historySlots);
+      images.push(...fromHistory);
+
+      const contextSlots = Math.max(0, Math.min(cfg.IMG_MAX_COUNT, slotsLeft()));
+      const contextCandidates =
+        contextSlots > 0 && usePlatform ? takeNew(platformContext.imageUrls, contextSlots) : [];
+      const fromContext = await prepareImageUrls(contextCandidates, cfg, contextSlots);
+      images.push(...fromContext);
+
+      const imageCandidates =
+        prepared.total + quotedImages.length + historyCandidates.length + platformContext.imageUrls.length;
       const skippedImages =
         prepared.skipped +
         Math.max(0, quotedImages.length - fromQuote.length) +
         Math.max(0, platformContext.imageUrls.length - fromContext.length);
+      // 每日读图额度用完（且本来有图可读）→ 让模型在回复里告诉用户
+      const quotaExhausted = images.length >= dailyBudget && imageCandidates > images.length;
+      if (images.length > 0) limits.consumeImages(msg.senderId, images.length);
+      if (quotaExhausted) {
+        log.info("qq", `读图额度已用完（今日上限 ${cfg.IMG_DAILY_LIMIT_PER_USER} 张），本次仅读 ${images.length} 张`);
+      }
 
       // 先渲染上下文、再记录本轮提问，避免当前问题在上下文里出现两次。
       history.record(msg.groupOpenid ?? "", {
         at: Date.now(),
         role: "user",
+        senderId: msg.senderId,
         ...(msg.senderName ? { senderName: msg.senderName } : {}),
         content: question !== "" ? question : hasImage ? "（发了图片）" : "（只 @ 了机器人，没有说话）",
+        ...(attachments.some((att) => att.content_type?.startsWith("image/"))
+          ? {
+              imageUrls: attachments
+                .filter((att) => att.content_type?.startsWith("image/") && typeof att.url === "string")
+                .map((att) => att.url),
+            }
+          : {}),
       });
 
       const result = await llm.complete(
@@ -250,6 +335,7 @@ export function createQqBot(deps: QqDeps): QQBot {
             contextLabel,
             senderName: msg.senderName,
             skippedImages,
+            ...(quotaExhausted ? { imageQuotaExhausted: true } : {}),
           }),
           images: images.map((image) => image.dataUrl),
           tool: FORWARD_FEEDBACK_TOOL,
@@ -262,19 +348,21 @@ export function createQqBot(deps: QqDeps): QQBot {
         systemPrompt,
       );
 
-      const reply =
+      const reply = ensureQuotaNotice(
         result.text !== ""
           ? result.text
           : result.forwarded
             ? "已经转交给人工了，正在处理中喵~"
-            : "呜……我暂时没找到答案，换个说法再问一次好不好喵~";
+            : "呜……我暂时没找到答案，换个说法再问一次好不好喵~",
+        quotaExhausted,
+      );
       for (const chunk of splitReply(reply, MAX_REPLY_CHARS, cfg.REPLY_MAX_CHUNKS)) {
         await bot.sendText(msg.replyTarget, chunk);
       }
       history.record(msg.groupOpenid ?? "", { at: Date.now(), role: "bot", content: reply });
       log.info(
         "qq",
-        `回复完成 ${Date.now() - started}ms｜转交=${result.forwarded}｜图片=${images.length}（消息附件 ${prepared.images.length}/${attachments.length}，引用 ${fromQuote.length}/${quotedImages.length}，上下文 ${fromContext.length}/${platformContext.imageUrls.length}）｜上下文来源=${contextSource}`,
+        `回复完成 ${Date.now() - started}ms｜转交=${result.forwarded}｜图片=${images.length}（消息附件 ${prepared.images.length}/${attachments.length}，引用 ${fromQuote.length}/${quotedImages.length}，缓冲 ${fromHistory.length}，上下文 ${fromContext.length}/${platformContext.imageUrls.length}）｜上下文来源=${contextSource}`,
       );
     }
   });

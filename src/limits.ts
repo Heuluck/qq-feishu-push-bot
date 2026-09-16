@@ -23,6 +23,8 @@ interface Persisted {
   day: string;
   userCounts: Record<string, number>;
   globalCount: number;
+  /** 单用户当天已读取的图片张数。 */
+  imageCounts?: Record<string, number>;
 }
 
 /**
@@ -35,6 +37,7 @@ interface Persisted {
 export class Limits {
   private day = dayKey();
   private readonly userCounts = new Map<string, number>();
+  private readonly imageCounts = new Map<string, number>();
   private globalCount = 0;
   private readonly minuteWindows = new Map<string, number[]>();
   private readonly groupWindows = new Map<string, number[]>();
@@ -69,6 +72,7 @@ export class Limits {
       if (raw.day === this.day) {
         this.globalCount = raw.globalCount ?? 0;
         for (const [key, value] of Object.entries(raw.userCounts ?? {})) this.userCounts.set(key, value);
+        for (const [key, value] of Object.entries(raw.imageCounts ?? {})) this.imageCounts.set(key, value);
         log.info(
           "limits",
           `今日配额已用：全局 ${this.globalCount}/${this.cfg.REPLY_LIMIT_GLOBAL_PER_DAY}`,
@@ -76,7 +80,12 @@ export class Limits {
       } else {
         // 上一次运行的日期已过：归档旧数据，从零开始（不覆盖 live 文件的归档由下次写入完成）。
         log.info("limits", `跨日，配额已重置（上次记录 ${raw.day}）`);
-        await this.archiveDay(raw.day, new Map(Object.entries(raw.userCounts ?? {})), raw.globalCount ?? 0);
+        await this.archiveDay(
+          raw.day,
+          new Map(Object.entries(raw.userCounts ?? {})),
+          raw.globalCount ?? 0,
+          new Map(Object.entries(raw.imageCounts ?? {})),
+        );
       }
     } catch {
       // 首次运行没有文件，正常。
@@ -176,20 +185,45 @@ export class Limits {
     if (today === this.day) return;
     const previous = this.day;
     log.info("limits", `跨日（${previous} → ${today}），配额已重置`);
-    if (this.globalCount > 0 || this.userCounts.size > 0) {
+    if (this.globalCount > 0 || this.userCounts.size > 0 || this.imageCounts.size > 0) {
       // 归档当天的用量，方便事后核对（保留期由 retention 模块统一清理）。
-      void this.archiveDay(previous, new Map(this.userCounts), this.globalCount);
+      void this.archiveDay(previous, new Map(this.userCounts), this.globalCount, new Map(this.imageCounts));
     }
     this.day = today;
     this.userCounts.clear();
+    this.imageCounts.clear();
     this.globalCount = 0;
   }
 
+  /** 今天还能为该用户读几张图。 */
+  imageBudget(senderId: string): number {
+    this.rollover();
+    return Math.max(0, this.cfg.IMG_DAILY_LIMIT_PER_USER - (this.imageCounts.get(senderId) ?? 0));
+  }
+
+  /** 记下本次为该用户读了几张图。 */
+  consumeImages(senderId: string, count: number): void {
+    if (count <= 0 || senderId === "") return;
+    this.rollover();
+    this.imageCounts.set(senderId, (this.imageCounts.get(senderId) ?? 0) + count);
+    this.scheduleSave();
+  }
+
   /** 把某一天的用量写成 limits.YYYY-MM-DD.json。 */
-  private async archiveDay(day: string, userCounts: Map<string, number>, globalCount: number): Promise<void> {
+  private async archiveDay(
+    day: string,
+    userCounts: Map<string, number>,
+    globalCount: number,
+    imageCounts = new Map<string, number>(),
+  ): Promise<void> {
     try {
       await mkdir(this.cfg.DATA_DIR, { recursive: true });
-      const payload: Persisted = { day, userCounts: Object.fromEntries(userCounts), globalCount };
+      const payload: Persisted = {
+        day,
+        userCounts: Object.fromEntries(userCounts),
+        globalCount,
+        ...(imageCounts.size > 0 ? { imageCounts: Object.fromEntries(imageCounts) } : {}),
+      };
       await writeFile(join(this.cfg.DATA_DIR, `limits.${day}.json`), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
       log.info("limits", `已归档 ${day} 的用量（全局 ${globalCount}，用户 ${userCounts.size} 个）`);
     } catch (err) {
@@ -221,6 +255,7 @@ export class Limits {
       day: this.day,
       userCounts: Object.fromEntries(this.userCounts),
       globalCount: this.globalCount,
+      imageCounts: Object.fromEntries(this.imageCounts),
     };
     const tmp = `${this.file}.tmp`;
     await writeFile(tmp, JSON.stringify(payload, null, 2), "utf8");

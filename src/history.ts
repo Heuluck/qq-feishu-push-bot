@@ -14,8 +14,12 @@ import { truncateText } from "./text.js";
 export interface HistoryEntry {
   at: number;
   role: "user" | "bot";
+  /** 用户 openid（机器人自己的记录没有）。用于「只取同一个用户发的图」。 */
+  senderId?: string;
   senderName?: string;
   content: string;
+  /** 这条消息带的图片 URL（后面可以把"用户先发截图、再 @ 提问"里的图喂给模型）。 */
+  imageUrls?: string[];
 }
 
 export class History {
@@ -57,6 +61,33 @@ export class History {
     const entries = [...this.fresh(this.byGroup.get(groupOpenid) ?? []), entry].slice(-this.cfg.HISTORY_MAX_STORED);
     this.byGroup.set(groupOpenid, entries);
     this.scheduleSave();
+  }
+
+  /**
+   * 某个用户最近发的图片 URL，最新的优先。
+   *
+   * 用途：「用户先发一张报错截图、再 @ 机器人问一句」是最常见的用法，
+   * 而截图那条消息没 @ 机器人，只进了缓冲——不把图抓下来，模型就只能说"看不清内容"。
+   * 只取**同一个用户**发的图：群里其他人的截图与当前问题无关，带上既费 token 又可能干扰判断。
+   * 不按「最近 N 条消息」找，而是按「该用户最近的图」找——用户连发几张截图后，中间很可能插入别人的消息，
+   * 按消息条数回看会把这些图挤出去（实测踩过：截图 5 条消息之前，于是一张都没带上）。
+   */
+  recentImageUrls(
+    groupOpenid: string,
+    senderId: string,
+    maxImages = this.cfg.IMG_CONTEXT_MAX_COUNT,
+  ): string[] {
+    if (!this.cfg.HISTORY_ENABLED || groupOpenid === "" || senderId === "" || maxImages <= 0) return [];
+    const entries = this.fresh(this.byGroup.get(groupOpenid) ?? []);
+    const urls: string[] = [];
+    for (const entry of [...entries].reverse()) {
+      if (entry.senderId !== senderId) continue;
+      for (const url of entry.imageUrls ?? []) {
+        if (!urls.includes(url)) urls.push(url);
+        if (urls.length >= maxImages) return urls;
+      }
+    }
+    return urls;
   }
 
   /** 渲染成本轮可注入的上下文文本；不含当前这条消息。 */

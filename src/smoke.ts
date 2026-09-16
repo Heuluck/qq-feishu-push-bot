@@ -13,7 +13,7 @@ import { History } from "./history.js";
 import { loadKnowledgeBase } from "./kb.js";
 import { Limits } from "./limits.js";
 import { prepareImageUrls, quotedImageUrls, resizeImageBuffer } from "./media.js";
-import { buildUserText, splitReply } from "./qq.js";
+import { buildUserText, ensureQuotaNotice, splitReply } from "./qq.js";
 import { FILE_PATTERNS, dayKey, migrateLegacyForwards, monthKey, pruneByAge, stampKey } from "./retention.js";
 import { stripMentions, truncateText } from "./text.js";
 import { FORWARD_FEEDBACK_TOOL, ForwardFeedbackArgs } from "./tools.js";
@@ -66,16 +66,23 @@ const small = await sharp({
   .toBuffer();
 
 const bigOut = await resizeImageBuffer(big, cfg);
-const bigMeta = await sharp(bigOut).metadata();
+const bigMeta = await sharp(bigOut.data).metadata();
 check(
   "大图缩放到长边上限",
   bigMeta.width === 1280 && (bigMeta.height ?? 0) <= 1280,
-  `2400x1600 → ${bigMeta.width}x${bigMeta.height}, ${bigOut.byteLength} 字节`,
+  `2400x1600 → ${bigMeta.width}x${bigMeta.height}, ${bigOut.data.byteLength} 字节`,
 );
 
+// PNG 且未超上限 → 原样透传，不重新编码（避免把截图里的小字压糊）
 const smallOut = await resizeImageBuffer(small, cfg);
-const smallMeta = await sharp(smallOut).metadata();
+const smallMeta = await sharp(smallOut.data).metadata();
 check("小图不放大", smallMeta.width === 320 && smallMeta.height === 200, `${smallMeta.width}x${smallMeta.height}`);
+check(
+  "小 PNG 原样透传（不重编码）",
+  smallOut.mime === "image/png" && Buffer.compare(smallOut.data, small) === 0,
+  `mime=${smallOut.mime}，字节与原图一致`,
+);
+check("超限 PNG 会重编码为 JPEG", bigOut.mime === "image/jpeg");
 
 // 4. 上下文解析（样本取自真实平台推送）
 const rawContext = `=== 消息 1 ===
@@ -114,6 +121,26 @@ check(
     userText.includes("我要退款旺仔牛奶") &&
     userText.includes("小明"),
 );
+
+const quotaText = buildUserText({
+  question: "这个怎么办",
+  senderName: "小明",
+  skippedImages: 0,
+  imageQuotaExhausted: true,
+});
+check(
+  "读图额度用完时：以【必须告知】标记要求写进回复",
+  quotaText.includes("【必须告知】") && quotaText.includes("读图额度已经用完"),
+);
+const skippedText = buildUserText({ question: "看看这个", senderName: "小明", skippedImages: 2 });
+check("图片读取失败时：同样带【必须告知】标记", skippedText.includes("【必须告知】") && skippedText.includes("2 张图片"));
+
+// 确定性兜底：模型漏说额度时由代码补一句
+check("额度兜底：模型漏说时补上", ensureQuotaNotice("已经转给负责的同学了。", true).includes("额度用完了"));
+check("额度兜底：模型已说明时不重复", ensureQuotaNotice("今天图片额度用完了，图没读到喵~", true) === "今天图片额度用完了，图没读到喵~");
+check("额度兜底：模型说「明天再发图」也算已告知", ensureQuotaNotice("先用文字描述，明天再发图也行~", true) === "先用文字描述，明天再发图也行~");
+check("额度兜底：没超额时不动回复", ensureQuotaNotice("课表不显示可以先连校园网。", false) === "课表不显示可以先连校园网。");
+check("额度兜底：回复为空时直接给告知句", ensureQuotaNotice("", true).startsWith("今天图片额度用完了"));
 
 // 6. 飞书卡片结构与话题聚合
 const sample = {
@@ -189,6 +216,7 @@ const limitsCfg = {
   RATE_LIMIT_PER_GROUP_PER_MINUTE: 100,
   REPLY_LIMIT_PER_USER_PER_DAY: 10,
   REPLY_LIMIT_GLOBAL_PER_DAY: 100,
+  IMG_DAILY_LIMIT_PER_USER: 10,
   PRIVILEGED_USERS: "PRIV_USER",
   PRIVILEGED_LIMIT_PER_DAY: 100,
 } as unknown as Config;
@@ -281,6 +309,17 @@ check("配额：跨日启动归档旧用量", existsSync(join(archiveDir, "limit
 check("配额：跨日启动后计数归零", staleLimits.check("老用户").ok);
 await staleLimits.flush();
 
+// 每日读图额度
+const imgLimiter = new Limits({ ...limitsCfg, DATA_DIR: "data/smoke-tmp/img" } as unknown as Config);
+await imgLimiter.init();
+check("读图额度：初始为每日上限", imgLimiter.imageBudget("U1") === limitsCfg.IMG_DAILY_LIMIT_PER_USER);
+imgLimiter.consumeImages("U1", 3);
+check("读图额度：扣减后剩余正确", imgLimiter.imageBudget("U1") === limitsCfg.IMG_DAILY_LIMIT_PER_USER - 3);
+check("读图额度：不同用户互不影响", imgLimiter.imageBudget("U2") === limitsCfg.IMG_DAILY_LIMIT_PER_USER);
+imgLimiter.consumeImages("U1", 999);
+check("读图额度：不会变成负数", imgLimiter.imageBudget("U1") === 0);
+await imgLimiter.flush();
+
 // 9. 本地对话缓冲（6 小时窗口）
 const historyCfg = {
   ...cfg,
@@ -289,6 +328,7 @@ const historyCfg = {
   HISTORY_WINDOW_MINUTES: 360,
   HISTORY_MAX_ENTRIES: 10,
   HISTORY_MAX_STORED: 50,
+  IMG_CONTEXT_MAX_COUNT: 5,
   CONTEXT_MESSAGE_MAX_CHARS: 600,
   CONTEXT_MAX_CHARS: 3000,
 } as unknown as Config;
@@ -345,6 +385,32 @@ await disabled.init();
 disabled.record("G1", { at: Date.now(), role: "user", content: "不该被记录" });
 check("缓冲：开关关闭后不记录也不注入", disabled.render("G1") === "");
 
+// 缓冲里的图片：「用户先发截图、再 @ 提问」时把图喂给模型，且只取同一个用户发的
+history.record("G6", { at: Date.now() - 60_000, role: "user", senderId: "U1", content: "（发了图片）", imageUrls: ["https://x/old.png"] });
+history.record("G6", { at: Date.now() - 45_000, role: "user", senderId: "U2", content: "（发了图片）", imageUrls: ["https://x/other.png"] });
+history.record("G6", { at: Date.now() - 30_000, role: "user", senderId: "U1", content: "发生什么了啊" });
+history.record("G6", { at: Date.now(), role: "user", senderId: "U1", content: "（发了图片）", imageUrls: ["https://x/new.png"] });
+history.record("G6", { at: Date.now(), role: "user", senderId: "U1", content: "（发了图片）", imageUrls: ["https://x/new.png"] });
+check(
+  "缓冲图片：只取同一用户发的图（别人发的排除）",
+  JSON.stringify(history.recentImageUrls("G6", "U1", 5)) === JSON.stringify(["https://x/new.png", "https://x/old.png"]),
+  "U2 的 other.png 未出现、重复的 new.png 只出现一次",
+);
+check("缓冲图片：受张数上限约束", history.recentImageUrls("G6", "U1", 1).length === 1);
+check("缓冲图片：开关关闭后不返回", disabled.recentImageUrls("G6", "U1").length === 0);
+
+// 回归：图后面又聊了好几句（含别人插话），仍要能找到该用户的图 —— 不能按「最近 N 条消息」找
+history.record("G7", { at: Date.now() - 90_000, role: "user", senderId: "U1", content: "（发了图片）", imageUrls: ["https://x/shot.png"] });
+for (let i = 0; i < 6; i += 1) {
+  history.record("G7", { at: Date.now() - 60_000 + i, role: "user", senderId: "U2", content: `别人的第 ${i + 1} 句` });
+}
+check(
+  "缓冲图片：中间夹着别人的消息也能找到该用户的图",
+  JSON.stringify(history.recentImageUrls("G7", "U1")) === JSON.stringify(["https://x/shot.png"]),
+);
+check("缓冲图片：默认上限取自 IMG_CONTEXT_MAX_COUNT", history.recentImageUrls("G7", "U1").length <= historyCfg.IMG_CONTEXT_MAX_COUNT);
+
+await history.flush();
 rmSync("data/smoke-tmp", { recursive: true, force: true });
 
 // 10. @ 标记清洗（平台会下发十六进制 openid 形态，SDK 内置规则只认纯数字）
