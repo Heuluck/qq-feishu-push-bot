@@ -541,6 +541,18 @@ check(
   "历史图片：中间夹着别人的消息也能找到该用户的图",
   history.render("G7", { speakerId: "U1" }).turns.some((t) => t.images.includes("https://x/shot.png")),
 );
+// 图注：给每张图一个不随窗口滑动的名字，模型才能在后续轮次引用它
+// （实测没有图注时问「第 1 张、第 2 张分别是什么颜色」会答错，甚至数错张数）。
+const labelled = history.render("G6", { speakerId: "U1" });
+check(
+  "历史图片：带图的轮次后面有「［图：HH:mm］」图注",
+  labelled.turns.some((t) => t.images.length > 0 && /［图：\d{2}:\d{2}］$/.test(t.text)),
+  labelled.turns.find((t) => t.images.length > 0)?.text,
+);
+check(
+  "历史图片：不带图的轮次没有图注",
+  labelled.turns.every((t) => t.images.length > 0 || !t.text.includes("［图：")),
+);
 
 // 10. 多轮 messages 的组装（llm 层）
 const fakeTool = { type: "function", function: { name: "t", parameters: { type: "object" } } } as never;

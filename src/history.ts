@@ -108,11 +108,16 @@ export class History {
     const windowed = entries.slice(-this.cfg.HISTORY_MAX_ENTRIES);
     const picked = pickImages(windowed, options.speakerId, this.cfg.IMG_CONTEXT_MAX_COUNT);
 
-    const turns: HistoryTurn[] = windowed.map((entry) => ({
-      role: entry.role,
-      images: (entry.imageUrls ?? []).filter((url) => picked.has(url)),
-      text: line(entry, this.cfg.CONTEXT_MESSAGE_MAX_CHARS),
-    }));
+    const turns: HistoryTurn[] = windowed.map((entry) => {
+      const images = (entry.imageUrls ?? []).filter((url) => picked.has(url));
+      const text = line(entry, this.cfg.CONTEXT_MESSAGE_MAX_CHARS);
+      // 带图的轮次后面加一个图注，作为这张图在本会话里的**名字**：
+      // Anthropic 的 vision 文档要求在多轮里给每张图一个短标签，否则后续轮次没法按名字引用它
+      // （实测问「第 1 张、第 2 张分别是什么颜色」会答错——模型没有「第几张」的概念）。
+      // 用该轮的时间而不是序号：时间不随窗口滑动而变，序号会。
+      const label = images.length === 0 ? "" : ` ［图：${hhmm(entry.at)}${images.length > 1 ? `（共 ${images.length} 张）` : ""}］`;
+      return { role: entry.role, images, text: `${text}${label}` };
+    });
 
     // 字符预算：从最新往前留，超了就**整轮**丢掉。
     // 不能像切字符串那样从中间切——切开会让「回答」和它的「提问」分家，模型会看到一个没有前因的答复。
