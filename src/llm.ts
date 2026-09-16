@@ -85,7 +85,18 @@ export class LlmClient {
         break;
       }
 
-      messages.push(choice);
+      // 回传时必须手工构造一个最小且合法的 assistant 轮：只带 role / content / tool_calls。
+      // 直接把 SDK 返回的对象 push 回去会带上 reasoning_content 等字段（DeepSeek 要求后续请求
+      // 不得包含它），assistant 轮不干净会让模型下一轮不再用结构化调用、改写散文。
+      messages.push({
+        role: "assistant",
+        content: choice.content ?? "",
+        tool_calls: calls.map((call) => ({
+          id: call.id,
+          type: "function" as const,
+          function: { name: call.function.name, arguments: call.function.arguments },
+        })),
+      });
       for (const call of calls) {
         const result = await input.execTool(call.function.name, call.function.arguments);
         if (result.forwarded) forwarded = true;
@@ -94,9 +105,19 @@ export class LlmClient {
       lastText = (choice.content ?? "").trim();
     }
 
+    // 模型没给出任何对用户说的话（常见于它接不上这个话题，比如看不到上文）：
+    // 不再回一句写死的文案，而是明确要求它自己组织一句。
+    // 注意这里必须把工具一起传下去——不给工具时，上下文里「答不了就转交」的要求会让它
+    // 只能把调用写成正文（这正是我们之前踩过的坑）。
+    if (lastText === "") {
+      const fallback = await this.askForReply(messages, input.tool, input.execTool, deadline);
+      lastText = fallback.text;
+      if (fallback.forwarded) forwarded = true;
+    }
+
     // 正文形态的工具调用：模型有时不返回结构化 tool_calls，而是把调用写进正文
-    // （原生 <||DSML||…> 标记或散文式一行）。必须解析并真的执行，同时把标记从回复里剔除，
-    // 否则既会把内部信息发给用户，又会出现「说已转交但其实没转交」。
+    // （原生 <||DSML||…> 标记或散文式一行）。放在最后跑，保证任何来源的文本都被处理：
+    // 不处理既会把内部信息发给用户，又会出现「说已转交但其实没转交」。
     const textCalls = await runTextToolCalls(lastText, (name, argsJson) => input.execTool(name, argsJson));
     if (textCalls.forwarded) forwarded = true;
     if (textCalls.calls.length > 0) {
@@ -104,19 +125,19 @@ export class LlmClient {
     }
     lastText = textCalls.text;
 
-    // 模型没给出任何对用户说的话（常见于它接不上这个话题，比如看不到上文）：
-    // 不再回一句写死的文案，而是明确要求它自己组织一句。
-    if (lastText === "") {
-      lastText = await this.askForReply(messages, deadline);
-    }
     return { text: lastText, forwarded };
   }
 
-  /** 追加一句要求，让模型自己补一句给用户的回复（不写死文案）。 */
+  /**
+   * 追加一句要求，让模型自己补一句给用户的回复（不写死文案）。
+   * 必须把工具一起传下去：不给工具时，上下文里「答不了就转交」的要求会让它只能把调用写成正文。
+   */
   private async askForReply(
     messages: ChatCompletionMessageParam[],
+    tool: ChatCompletionTool,
+    execTool: ToolExecutor,
     signal: AbortSignal,
-  ): Promise<string> {
+  ): Promise<{ text: string; forwarded: boolean }> {
     try {
       const res = await this.client.chat.completions.create(
         {
@@ -129,15 +150,23 @@ export class LlmClient {
                 "（系统提示：请直接用一两句话回应用户。如果是因为你看不到上一条消息或缺少上文，就直接说明这一点，并请他把问题再发一次、或引用你上一条回复。）",
             },
           ],
+          tools: [tool],
+          tool_choice: "auto",
           max_tokens: this.cfg.LLM_MAX_TOKENS,
         },
         { signal },
       );
       this.logUsage(res.usage);
-      return (res.choices[0]?.message.content ?? "").trim();
+      const choice = res.choices[0]?.message;
+      let forwarded = false;
+      for (const call of (choice?.tool_calls ?? []).filter((item) => item.type === "function")) {
+        const result = await execTool(call.function.name, call.function.arguments);
+        if (result.forwarded) forwarded = true;
+      }
+      return { text: (choice?.content ?? "").trim(), forwarded };
     } catch (err) {
       log.warn("llm", `补一次回复失败：${err instanceof Error ? err.message : String(err)}`);
-      return "";
+      return { text: "", forwarded: false };
     }
   }
 
