@@ -1,0 +1,98 @@
+# 知识库：单文件 YAML。整体会编译进 system prompt，保持静态以命中模型前缀缓存。
+# 规模建议 2000 字以内（约 3k token）。改完保存、重启进程即生效。
+#
+# route 取值：
+#   answer             可直接回复用户（必须写 answer）
+#   forward            需转交人工（建议写 forward_hint）
+#   answer_and_forward 先回复用户，同时转交人工（用户自助能办、但可能需要人工兜底的场景）
+
+entries:
+  - id: greeting
+    title: 打招呼 / 使用引导
+    keywords: [你好, 在吗, 怎么用, 帮助]
+    route: answer
+    answer: |
+      你好，我是homebot。直接@我发问题给我就行；
+      如果是报错或界面异常，把截图一起发过来，最后再@我。
+
+  - id: reset-phone
+    title: 修改手机号
+    keywords: [手机号, 新手机, 手机卡丢了, 登录不上, 无法登录]
+    route: answer_and_forward
+    answer: |
+      旧手机号还能用的话，打开南大家园-生活-云家园-右上角账号设置-密保手机，自己就能改；
+      旧号已经不能用了就得我们手动帮你处理，这条消息我已经帮你转给负责的同学了。
+    forward_hint: |
+      请稍后私信负责的同学你的姓名、学号、新手机号、旧手机号，请勿发到群里
+
+  - id: no-schedule
+    title: 没有课表 / 不显示课表
+    keywords: [没课表, 不显示]
+    route: answer
+    answer: |
+      请尝试连接校园网、他人热点（移动卡可能会有连接问题）；或打开教务系统（https://jwpt.ncu.edu.cn/jsxsd/sso.jsp）-「学期理论课表」查看本学期是否有课。如果对教务系统有疑问，请咨询0791-83969101。
+  
+  - id: wrong-schedule
+    title: 课表有误 / 选课完课表不同步
+    keywords: [课表, 课程, 缺课, 少课, 不一致, 不一样, 选课, 退课]
+    route: answer
+    answer: |
+      课表每日同步，刚选退课需要等待明天同步，请以教务系统为准。可对比教务系统（https://jwpt.ncu.edu.cn/jsxsd/sso.jsp）-「学期理论课表」查看是否确有此课。如果对教务系统有疑问，请咨询0791-83969101。
+
+  - id: download
+    title: 下载南大家园
+    keywords: [下载, 更新]
+    route: answer
+    answer: |
+      请在 https://incu.ncu.edu.cn/ 下载最新版南大家园，群文件内也有最新版安装包
+
+  - id: wrong-timeline
+    title: 上课时间不对
+    keywords: [下载, 更新]
+    route: answer
+    answer: |
+      根据教务处2026秋季学期上课时间变动，我们已更新南大家园时间表，请在 https://incu.ncu.edu.cn/ 更新最新版南大家园，群文件内也有最新版安装包
+
+  - id: master-student
+    title: 研究生能否使用南大家园
+    keywords: [硕士, 博士, 研究生]
+    route: answer
+    answer: |
+      十分抱歉，由于缺少数据，南大家园暂不支持研究生使用
+
+  - id: ncu-center
+    title: 融合门户 / 企业微信 / 邮箱 相关问题
+    keywords: [融合门户, 企业微信, 邮箱]
+    route: answer
+    answer: |
+      请联系南昌大学网络与信息中心。
+      联系电话：0791-83968673，0791-83969312
+      工作时间：8:30-12:00，13:30-22:00
+
+  - id: mystery-store
+    title: 神秘商店是什么
+    keywords: [神秘商店]
+    route: answer
+    answer: |
+      可以兑换神秘物品的地方——可以关注一下我们的后续活动
+
+  - id: electric-app-missing
+    title: 电费查询应用不见了
+    keywords: [电费]
+    route: answer
+    answer: |
+      根据学校要求，南大家园电费查询已下架。请前往企业微信一码通查询和缴费
+
+  - id: electric
+    title: 电费对不上 / 交了钱没电
+    keywords: [电费, 电]
+    route: answer
+    answer: |
+      请联系学校水电中心 0791-83969182 或 15797965280 (金老师)
+
+  - id: bug-report
+    title: 功能异常 / 崩溃 / 报错
+    keywords: [报错, 崩溃, 闪退, 用不了, bug, 卡住]
+    route: forward
+    forward_hint: |
+      推荐用户下载最新版。需要用户提供：App 版本、手机型号与系统版本、出问题的操作步骤、报错截图。

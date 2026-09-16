@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    container_name: incu-qq-bot
+    restart: unless-stopped
+    env_file: .env
+    # 无 ports：机器人只走出站连接，不需要暴露任何端口
+    mem_limit: 320m
+    volumes:
+      - ./kb:/app/kb:ro
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
