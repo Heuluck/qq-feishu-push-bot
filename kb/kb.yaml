@@ -78,8 +78,8 @@ entries:
       十分抱歉，由于缺少数据，南大家园暂不支持研究生使用
 
   - id: ncu-center
-    title: 融合门户 / 企业微信 / 邮箱 相关问题
-    keywords: [融合门户, 企业微信, 邮箱]
+    title: 融合门户 / 企业微信 / 邮箱 / 校园网 相关问题
+    keywords: [融合门户, 企业微信, 邮箱, 校园网]
     route: answer
     answer: |
       请联系南昌大学网络与信息中心。
