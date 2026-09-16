@@ -94,50 +94,53 @@ export class LlmClient {
   }
 
   /**
-   * 请求结构：`[system 规则 + 知识库]` + 历史轮次 + `[本轮提问]`。
+   * 请求结构：`[system 规则 + 知识库]` + 历史轮次 + `[本轮提问]`，**一次调用完成**。
    *
    * 历史用真正的多轮 messages 而不是拼成一段文本，有两个理由：
    *   - 图片待在它到来的那一轮里，模型才有依据区分「这次发的」和「翻出来的旧图」；
    *   - 从 system 到历史是**逐字节稳定、只往后追加**的前缀，能命中厂商的前缀缓存，
    *     只有最新那一轮按原价计费。把整段历史塞进当前那条 user 消息，它每轮都变，缓存全废。
    * 工具定义在每轮都传入且不变，避免破坏前缀。
+   *
+   * **为什么不照抄「调用工具 → 回灌结果 → 再要一次」的标准两轮循环**：模型本来就是
+   * 在**同一条 assistant 消息**里既给正文又给 tool_calls（协议允许，正文在协议上就是它说的话），
+   * 而那一轮它通常已经把完整答案写好了。两轮循环只取第二轮，等于把第一轮的答案丢掉：
+   * 实测最后一轮常常只剩一句「已转交」，甚至写一句指向上一轮的备注——用户收到的是
+   * 「（已在上方回复中说明转交）」，而答案全在被丢掉的那一轮里。多一次调用还慢一倍。
+   *
+   * 代价是模型写正文时还不知道工具结果，所以提示词要求它把转交说成将来时（「我会帮你转给…」）。
+   * 工具结果里那点信息（成功/已转过/通道没就绪/每小时超限）本来也只有失败路径需要它改口。
    */
   async complete(input: CompleteInput, systemPrompt: string): Promise<CompleteResult> {
     const messages = buildMessages(input, systemPrompt);
 
     const deadline = AbortSignal.timeout(this.cfg.LLM_DEADLINE_MS);
     let forwarded = false;
-    let lastText = "";
-    // 只记**进了 messages 的那些**调用。补答（askForReply）与正文形态解析出来的调用都没进
-    // messages 数组，记进对话缓冲反而会让下一轮的前缀和这一轮对不上，所以不记。
     const toolRounds: ToolRound[] = [];
 
-    for (let round = 0; round < 2; round += 1) {
-      const res = await this.client.chat.completions.create(
-        {
-          model: this.cfg.LLM_MODEL,
-          messages,
-          tools: input.tools,
-          tool_choice: "auto",
-          max_tokens: this.cfg.LLM_MAX_TOKENS,
-          ...this.thinkingParams(),
-        },
-        { signal: deadline },
-      );
-      this.logUsage(res.usage);
+    const res = await this.client.chat.completions.create(
+      {
+        model: this.cfg.LLM_MODEL,
+        messages,
+        tools: input.tools,
+        tool_choice: "auto",
+        max_tokens: this.cfg.LLM_MAX_TOKENS,
+        ...this.thinkingParams(),
+      },
+      { signal: deadline },
+    );
+    this.logUsage(res.usage);
 
-      const choice = res.choices[0]?.message;
-      if (!choice) throw new Error("模型返回了空响应");
+    const choice = res.choices[0]?.message;
+    if (!choice) throw new Error("模型返回了空响应");
 
-      const calls = (choice.tool_calls ?? []).filter((call) => call.type === "function");
-      if (calls.length === 0) {
-        lastText = (choice.content ?? "").trim();
-        break;
-      }
+    const calls = (choice.tool_calls ?? []).filter((call) => call.type === "function");
+    let lastText = (choice.content ?? "").trim();
 
-      // 回传时必须手工构造一个最小且合法的 assistant 轮：只带 role / content / tool_calls。
-      // 直接把 SDK 返回的对象 push 回去会带上 reasoning_content 等字段（DeepSeek 要求后续请求
-      // 不得包含它），assistant 轮不干净会让模型下一轮不再用结构化调用、改写散文。
+    if (calls.length > 0) {
+      // 回传给下一步（补答）时必须手工构造一个最小且合法的 assistant 轮：只带
+      // role / content / tool_calls。直接把 SDK 返回的对象 push 回去会带上 reasoning_content
+      // 等字段（DeepSeek 要求后续请求不得包含它）。
       messages.push({
         role: "assistant",
         content: choice.content ?? "",
@@ -160,13 +163,10 @@ export class LlmClient {
         });
       }
       toolRounds.push(toolRound);
-      lastText = (choice.content ?? "").trim();
     }
 
-    // 模型没给出任何对用户说的话（常见于它接不上这个话题，比如看不到上文）：
-    // 不再回一句写死的文案，而是明确要求它自己组织一句。
-    // 注意这里必须把工具一起传下去——不给工具时，上下文里「答不了就转交」的要求会让它
-    // 只能把调用写成正文（这正是我们之前踩过的坑）。
+    // 模型没给出任何对用户说的话（常见于它只顾着调工具）：不再回一句写死的文案，
+    // 而是把工具结果一并交回去、明确要求它自己组织一句。
     if (lastText === "") {
       const fallback = await this.askForReply(messages, input.tools, input.execTool, deadline);
       lastText = fallback.text;

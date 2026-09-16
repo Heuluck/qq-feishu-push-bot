@@ -96,10 +96,9 @@ export function splitReply(text: string, max = MAX_REPLY_CHARS, maxChunks = 3): 
 /**
  * 暴露给模型的工具定义。个数与内容必须稳定，否则会破坏请求前缀缓存。
  *
- * `SEND_FOLLOWUP_TOOL` 是「模型想多发一条消息」的出口。它单独给出来是没用的——之前试过，
- * 漏答率没变化（两臂各 8 次都是 25%–40%）——但和系统提示词里那句「只有你最后的回复会发出」
- * 配合起来才有意义：先告诉它**只有最后一条会被发出**，再给它一个「确实想发两条时怎么办」的办法，
- * 它就不会再把答案塞进那个发不出去的位置。
+ * `SEND_FOLLOWUP_TOOL` 是「模型想多发一条消息」的出口：正文之外再排一条，由 `qq.ts` 在正文之后发出。
+ * 一次调用完成的流程下它不是必需的（实测只有 1/10 会用到），留着是因为「想分开说两件事」是真实需求，
+ * 而平台允许同一 `msg_id` 最多发 5 条。
  */
 export const EXPOSED_TOOLS = [FORWARD_FEEDBACK_TOOL, SEND_FOLLOWUP_TOOL];
 
@@ -432,8 +431,7 @@ export function createQqBot(deps: QqDeps): QQBot {
       for (const chunk of splitReply(reply, MAX_REPLY_CHARS, maxMainChunks)) {
         await bot.sendText(msg.replyTarget, chunk);
       }
-      // 补充消息在主回复**之后**单独发出。当前没有把 send_followup 暴露给模型，
-      // 所以 tools.followups 恒为空——这段留着是为了让工具随时能重新启用（见 EXPOSED_TOOLS）。
+      // 补充消息在主回复**之后**单独发出：模型想「答案一条、转交说明一条」时用它。
       for (const extra of tools.followups) {
         log.info("qq", `补充消息：${extra.slice(0, 60)}`);
         for (const chunk of splitReply(extra, MAX_REPLY_CHARS, 1)) {
