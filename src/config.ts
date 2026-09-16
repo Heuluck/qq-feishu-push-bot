@@ -51,6 +51,8 @@ const EnvSchema = z.object({
   HISTORY_WINDOW_MINUTES: z.coerce.number().int().min(1).max(10_080).default(360),
   /** 本地对话缓冲最多注入几条（默认最近 10 条）。 */
   HISTORY_MAX_ENTRIES: z.coerce.number().int().min(1).max(100).default(10),
+  /** 本地对话缓冲最多存放几条（只影响存储；留多一些，方便以后调大注入条数）。 */
+  HISTORY_MAX_STORED: z.coerce.number().int().min(1).max(1000).default(50),
   /** 回复最多分成几条发送（QQ 对同一 msg_id 的被动回复条数有限，防御性设上限）。 */
   REPLY_MAX_CHUNKS: z.coerce.number().int().min(1).max(10).default(3),
 

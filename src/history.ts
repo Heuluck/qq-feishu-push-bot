@@ -40,7 +40,12 @@ export class History {
           kept += fresh.length;
         }
       }
-      if (kept > 0) log.info("history", `已载入 ${this.byGroup.size} 个群的近况（${kept} 条，窗口 ${this.cfg.HISTORY_WINDOW_MINUTES} 分钟）`);
+      if (kept > 0) {
+        log.info(
+          "history",
+          `已载入 ${this.byGroup.size} 个群的近况（${kept} 条，窗口 ${this.cfg.HISTORY_WINDOW_MINUTES} 分钟，最多存 ${this.cfg.HISTORY_MAX_STORED} / 注入 ${this.cfg.HISTORY_MAX_ENTRIES} 条）`,
+        );
+      }
     } catch {
       // 首次运行没有文件，正常。
     }
@@ -49,7 +54,7 @@ export class History {
   /** 记录一条对话（用户提问或机器人回复）。 */
   record(groupOpenid: string, entry: HistoryEntry): void {
     if (!this.cfg.HISTORY_ENABLED || groupOpenid === "") return;
-    const entries = [...this.fresh(this.byGroup.get(groupOpenid) ?? []), entry].slice(-this.cfg.HISTORY_MAX_ENTRIES);
+    const entries = [...this.fresh(this.byGroup.get(groupOpenid) ?? []), entry].slice(-this.cfg.HISTORY_MAX_STORED);
     this.byGroup.set(groupOpenid, entries);
     this.scheduleSave();
   }
@@ -57,7 +62,7 @@ export class History {
   /** 渲染成本轮可注入的上下文文本；不含当前这条消息。 */
   render(groupOpenid: string): string {
     if (!this.cfg.HISTORY_ENABLED || groupOpenid === "") return "";
-    const entries = this.fresh(this.byGroup.get(groupOpenid) ?? []);
+    const entries = this.fresh(this.byGroup.get(groupOpenid) ?? []).slice(-this.cfg.HISTORY_MAX_ENTRIES);
     if (entries.length === 0) return "";
 
     const lines = entries.map((entry) => {
@@ -78,9 +83,10 @@ export class History {
     if (this.dirty) await this.writeEntries();
   }
 
+  /** 按时间窗过滤，并按「存储上限」截取最新的一批；注入时再收窄到 HISTORY_MAX_ENTRIES。 */
   private fresh(entries: HistoryEntry[]): HistoryEntry[] {
     const cutoff = Date.now() - this.cfg.HISTORY_WINDOW_MINUTES * 60_000;
-    return entries.filter((entry) => entry.at >= cutoff).slice(-this.cfg.HISTORY_MAX_ENTRIES);
+    return entries.filter((entry) => entry.at >= cutoff).slice(-this.cfg.HISTORY_MAX_STORED);
   }
 
   private scheduleSave(): void {

@@ -3,7 +3,7 @@
  *   npm run smoke
  * 覆盖知识库编译、工具 schema/校验、图片缩放、回复拆分这几条纯逻辑。
  */
-import { existsSync, mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import sharp from "sharp";
 import type { Config } from "./config.js";
@@ -288,6 +288,7 @@ const historyCfg = {
   HISTORY_ENABLED: true,
   HISTORY_WINDOW_MINUTES: 360,
   HISTORY_MAX_ENTRIES: 10,
+  HISTORY_MAX_STORED: 50,
   CONTEXT_MESSAGE_MAX_CHARS: 600,
   CONTEXT_MAX_CHARS: 3000,
 } as unknown as Config;
@@ -318,10 +319,21 @@ for (let i = 0; i < 40; i += 1) {
 }
 const capped = history.render("G3");
 check(
-  "缓冲：条数与字符数受上限约束",
+  "缓冲：注入条数与字符数受上限约束",
   capped.split("\n").length <= 10 && capped.length <= 3100,
   `${capped.split("\n").length} 行 / ${capped.length} 字符`,
 );
+
+// 存储上限与注入上限分开：存 50 条，注入仍只给 10 条
+for (let i = 0; i < 80; i += 1) {
+  history.record("G4", { at: Date.now(), role: "user", content: `消息 ${i}` });
+}
+await history.flush();
+const stored = (JSON.parse(readFileSync("data/smoke-tmp/history/history.json", "utf8")) as Record<string, unknown[]>)[
+  "G4"
+];
+check("缓冲：存储上限 50 条", stored !== undefined && stored.length === 50, `实际存 ${stored?.length ?? 0} 条`);
+check("缓冲：注入仍只取最近 10 条", history.render("G4").split("\n").length === 10);
 
 await history.flush();
 const reloaded = new History(historyCfg);
