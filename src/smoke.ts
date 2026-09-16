@@ -14,7 +14,7 @@ import { loadKnowledgeBase } from "./kb.js";
 import { Limits } from "./limits.js";
 import { buildMessages } from "./llm.js";
 import { clearPreparedImageCache, prepareImages, prepareImageUrls, quotedImageUrls, resizeImageBuffer } from "./media.js";
-import { buildUserText, createSerialQueue, ensureQuotaNotice, platformBackground, splitReply } from "./qq.js";
+import { EXPOSED_TOOLS, buildUserText, createSerialQueue, ensureQuotaNotice, platformBackground, splitReply } from "./qq.js";
 import { FILE_PATTERNS, dayKey, migrateLegacyForwards, monthKey, pruneByAge, stampKey } from "./retention.js";
 import { stripMentions, truncateText } from "./text.js";
 import { extractTextToolCalls, runTextToolCalls } from "./toolmarkup.js";
@@ -175,12 +175,20 @@ const forwardedOnce = await turn3.exec("forward_feedback", JSON.stringify({ summ
 check("转交：仍走原来的路径", forwardedOnce.forwarded && turn3.followups.length === 0);
 check("未知工具仍然被挡", (await turn3.exec("delete_everything", "{}")).text.includes("未知工具"));
 
+// 补充消息工具：代码留着，但**不注入**给模型（实测给这个出口不减少漏答，见 src/qq.ts）。
 check(
-  "提示词：告知了 send_followup 及其「每轮最多一次」的限制",
-  kb.systemPrompt.includes("send_followup") &&
-    kb.systemPrompt.includes("每轮最多调用一次") &&
-    kb.systemPrompt.includes("先发你的主回复"),
+  "工具注入：只把 forward_feedback 暴露给模型，send_followup 不注入",
+  EXPOSED_TOOLS.length === 1 && EXPOSED_TOOLS[0]!.function.name === "forward_feedback",
+  EXPOSED_TOOLS.map((t) => t.function.name).join(","),
 );
+check("工具注入：提示词里不再提 send_followup", !kb.systemPrompt.includes("send_followup"));
+check(
+  "提示词：转交时必须把每件事答清楚，且明确优先于「说话要短」",
+  kb.systemPrompt.includes("【硬规则】转交也必须把用户问的每件事都答清楚") &&
+    kb.systemPrompt.includes("宁可多写几句，也不许只回一句「已转交」") &&
+    kb.systemPrompt.includes("这条优先于「说话要短」"),
+);
+check("提示词：「短」那条指明了要交代的事情多时不适用", kb.systemPrompt.includes("这条不适用于「要交代的事情多」的时候"));
 check("提示词：禁止在 details 里写「已回复」这类声明", kb.systemPrompt.includes("不要写「已回复」「已告知」这类声明"));
 
 // 3. 图片缩放

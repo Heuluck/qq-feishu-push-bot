@@ -18,7 +18,7 @@ import { log, qqLogger } from "./log.js";
 import { normalizeUrl, prepareImageUrls, prepareImages, quotedImageUrls } from "./media.js";
 import type { InboundAttachment, PreparedImage } from "./media.js";
 import { stripMentions, truncateText } from "./text.js";
-import { FORWARD_FEEDBACK_TOOL, SEND_FOLLOWUP_TOOL, createTurnTools } from "./tools.js";
+import { FORWARD_FEEDBACK_TOOL, createTurnTools } from "./tools.js";
 
 /** 单条回复的分段长度。 */
 const MAX_REPLY_CHARS = 1600;
@@ -92,6 +92,16 @@ export function splitReply(text: string, max = MAX_REPLY_CHARS, maxChunks = 3): 
   }
   return chunks.filter((chunk) => chunk !== "");
 }
+
+/**
+ * 暴露给模型的工具定义。个数与内容必须稳定，否则会破坏请求前缀缓存。
+ *
+ * `SEND_FOLLOWUP_TOOL` **故意不在这里**：工具本体与「每轮最多一条」的代码层限制都留着
+ * （见 `src/tools.ts` 的 `createTurnTools`），但实测给模型这个出口并不减少漏答——
+ * 用真实历史做对照、两臂各跑 8 次，漏答率都在 25%–40%，和不给时一样，代价是平均多
+ * 0.4–0.8 条消息。所以「转交时把答案说清楚」改由提示词的硬规则来保证。
+ */
+export const EXPOSED_TOOLS = [FORWARD_FEEDBACK_TOOL];
 
 export const PLATFORM_CONTEXT_LABEL =
   "[对话上下文] 平台给的背景：这条消息之前群里的最近几条消息，可能含其他成员的消息与附件。它是背景，不是这次要处理的新问题";
@@ -403,7 +413,7 @@ export function createQqBot(deps: QqDeps): QQBot {
         {
           history: historyTurns,
           userParts,
-          tools: [FORWARD_FEEDBACK_TOOL, SEND_FOLLOWUP_TOOL],
+          tools: EXPOSED_TOOLS,
           execTool: tools.exec,
         },
         systemPrompt,
@@ -422,8 +432,8 @@ export function createQqBot(deps: QqDeps): QQBot {
       for (const chunk of splitReply(reply, MAX_REPLY_CHARS, maxMainChunks)) {
         await bot.sendText(msg.replyTarget, chunk);
       }
-      // 补充消息在主回复**之后**单独发出：模型用它把「答案」和「已转交」分开说，
-      // 免得两件事挤在一句里、或者干脆只留一句「已转交」。
+      // 补充消息在主回复**之后**单独发出。当前没有把 send_followup 暴露给模型，
+      // 所以 tools.followups 恒为空——这段留着是为了让工具随时能重新启用（见 EXPOSED_TOOLS）。
       for (const extra of tools.followups) {
         log.info("qq", `补充消息：${extra.slice(0, 60)}`);
         for (const chunk of splitReply(extra, MAX_REPLY_CHARS, 1)) {
