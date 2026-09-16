@@ -183,12 +183,9 @@ check(
 );
 check("工具注入：提示词里不再提 send_followup", !kb.systemPrompt.includes("send_followup"));
 check(
-  "提示词：转交时必须把每件事答清楚，且明确优先于「说话要短」",
-  kb.systemPrompt.includes("【硬规则】转交也必须把用户问的每件事都答清楚") &&
-    kb.systemPrompt.includes("宁可多写几句，也不许只回一句「已转交」") &&
-    kb.systemPrompt.includes("这条优先于「说话要短」"),
+  "提示词：转交时也要把能答的答给用户（不能只写在 details 里）",
+  kb.systemPrompt.includes("不要只在 details 里写了答案却没告诉用户"),
 );
-check("提示词：「短」那条指明了要交代的事情多时不适用", kb.systemPrompt.includes("这条不适用于「要交代的事情多」的时候"));
 check("提示词：禁止在 details 里写「已回复」这类声明", kb.systemPrompt.includes("不要写「已回复」「已告知」这类声明"));
 
 // 3. 图片缩放
