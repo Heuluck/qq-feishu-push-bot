@@ -5,6 +5,23 @@
 #   answer             可直接回复用户（必须写 answer）
 #   forward            需转交人工（建议写 forward_hint）
 #   answer_and_forward 先回复用户，同时转交人工（用户自助能办、但可能需要人工兜底的场景）
+#
+# 变量：在顶层 variables 里定义，正文用 {{名称}} 引用。
+# 名称只能用字母、数字、下划线、短横线；变量可以引用别的变量（电话、网址这类只写一处）。
+# 未定义、循环引用、名字写错都会在启动时报错并拒绝启动，不会把花括号原样发给同学。
+
+variables:
+  # 当前发布版本。必须加引号：不加引号的 5.0 之类会被 YAML 当成数字，小数位会丢掉
+  latest-version: "5.16.0"
+
+  # 应用下载站（官网）+ 群文件兜底
+  app-download: https://incu.ncu.edu.cn/
+  app-package-hint: 群文件内也有最新版安装包
+
+  # 教务系统入口与咨询电话
+  jwpt: https://jwpt.ncu.edu.cn/jsxsd/sso.jsp
+  jwpt-phone: "0791-83969101"
+  jwpt-help: 如果对教务系统有疑问，请咨询{{jwpt-phone}}。
 
 entries:
   - id: greeting
@@ -30,28 +47,28 @@ entries:
     keywords: [没课表, 不显示]
     route: answer
     answer: |
-      请尝试连接校园网、他人热点（移动卡可能会有连接问题）；或打开教务系统（https://jwpt.ncu.edu.cn/jsxsd/sso.jsp）-「学期理论课表」查看本学期是否有课。如果对教务系统有疑问，请咨询0791-83969101。
-  
+      请尝试连接校园网、他人热点（移动卡可能会有连接问题）；或打开教务系统（{{jwpt}}）-「学期理论课表」查看本学期是否有课。{{jwpt-help}}
+
   - id: wrong-schedule
     title: 课表有误 / 选课完课表不同步
     keywords: [课表, 课程, 缺课, 少课, 不一致, 不一样, 选课, 退课]
     route: answer
     answer: |
-      课表每日同步，刚选退课需要等待明天同步，请以教务系统为准。可对比教务系统（https://jwpt.ncu.edu.cn/jsxsd/sso.jsp）-「学期理论课表」查看是否确有此课。如果对教务系统有疑问，请咨询0791-83969101。
+      课表每日同步，刚选退课需要等待明天同步，请以教务系统为准。可对比教务系统（{{jwpt}}）-「学期理论课表」查看是否确有此课。{{jwpt-help}}
 
   - id: download
     title: 下载南大家园
     keywords: [下载, 更新]
     route: answer
     answer: |
-      请在 https://incu.ncu.edu.cn/ 下载最新版南大家园，群文件内也有最新版安装包
+      请在 {{app-download}} 下载最新版南大家园（当前版本 {{latest-version}}），{{app-package-hint}}
 
   - id: wrong-timeline
     title: 上课时间不对
     keywords: [下载, 更新]
     route: answer
     answer: |
-      根据教务处2026秋季学期上课时间变动，我们已更新南大家园时间表，请在 https://incu.ncu.edu.cn/ 更新最新版南大家园，群文件内也有最新版安装包
+      根据教务处2026秋季学期上课时间变动，我们已更新南大家园时间表，请在 {{app-download}} 更新最新版南大家园（{{latest-version}}），{{app-package-hint}}
 
   - id: master-student
     title: 研究生能否使用南大家园

@@ -44,6 +44,84 @@ check(
   `${kb.systemPrompt.length} 字符`,
 );
 
+// 1b. 知识库变量（正文用 {{名称}} 复用 variables 里的文本片段）
+const kbVarDir = "data/smoke-tmp/kb";
+mkdirSync(kbVarDir, { recursive: true });
+const writeKb = (name: string, body: string): string => {
+  const path = `${kbVarDir}/${name}.yaml`;
+  writeFileSync(path, body);
+  return path;
+};
+const loadError = (path: string): string => {
+  try {
+    loadKnowledgeBase(path);
+    return "";
+  } catch (error) {
+    return (error as Error).message;
+  }
+};
+const kbBody = (answer: string): string =>
+  `entries:\n  - id: a\n    title: t\n    keywords: [k]\n    route: answer\n    answer: "${answer}"\n`;
+
+check("知识库：占位符已全部展开，没有花括号漏进提示词", !kb.systemPrompt.includes("{{"));
+check(
+  "知识库：变量引用变量（教务电话只写一处，两条正文都展开）",
+  (kb.systemPrompt.match(/0791-83969101/g) ?? []).length === 2,
+);
+check(
+  "知识库：版本号只写一处，两条下载相关正文都带上",
+  (kb.systemPrompt.match(/当前版本 5\.16\.0/g) ?? []).length === 2,
+);
+
+const nestedKb = loadKnowledgeBase(
+  writeKb(
+    "nested",
+    `variables:
+  site: https://example.com/
+  hint: 群文件里也有
+  combo: 先去 {{site}}，{{hint}}。
+  blocky: |
+    多行变量
+    第二行
+entries:
+  - id: a
+    title: t
+    keywords: [k]
+    route: answer
+    answer: "{{combo}}"
+  - id: b
+    title: t2
+    keywords: [k2]
+    route: answer
+    answer: "行尾{{blocky}}再接一句"
+`,
+  ),
+);
+check(
+  "知识库变量：变量可以引用变量",
+  nestedKb.entries[0]?.answer === "先去 https://example.com/，群文件里也有。",
+  JSON.stringify(nestedKb.entries[0]?.answer),
+);
+check(
+  "知识库变量：块标量变量的收尾换行被 trim（不会把句子断成两行）",
+  nestedKb.entries[1]?.answer === "行尾多行变量\n第二行再接一句",
+  JSON.stringify(nestedKb.entries[1]?.answer),
+);
+check(
+  "知识库变量：variables 本身不进 system prompt",
+  !nestedKb.systemPrompt.includes("combo:") && !nestedKb.systemPrompt.includes("{{"),
+);
+check("知识库变量：未定义变量报错", loadError(writeKb("undef", kbBody("见 {{nope}}"))).includes("{{nope}} 未定义"));
+check(
+  "知识库变量：循环引用报错",
+  loadError(writeKb("cycle", `variables:\n  a: "{{b}}"\n  b: "{{a}}"\n${kbBody("x")}`)).includes("循环引用"),
+);
+check("知识库变量：变量名写错报错", loadError(writeKb("typo", kbBody("版本 {{版本号}}"))).includes("没解析成功"));
+check(
+  "知识库变量：不加引号的数字报错（5.0 会被 YAML 解析成 5）",
+  loadError(writeKb("numeric", `variables:\n  ver: 5.0\n${kbBody("版本 {{ver}}")}`)).includes("请加引号"),
+);
+
 // 2. 工具定义与参数校验
 const params = FORWARD_FEEDBACK_TOOL.function.parameters as { type?: string; properties?: Record<string, unknown> };
 check("工具 schema 生成", params?.type === "object" && Boolean(params.properties?.["summary"]));

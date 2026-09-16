@@ -27,8 +27,22 @@ const ROUTE_LABEL: Record<"answer" | "forward" | "answer_and_forward", string> =
   answer_and_forward: "先回复用户，同时转交人工",
 };
 
+/**
+ * 变量占位符 `{{名称}}`（名称两侧允许留空格）。
+ * YAML 本身没有字符串插值，锚点又只能整体替换一个节点、没法嵌进句子中间，
+ * 所以「同一段文本只写一处」这件事只能由加载器来做。
+ *
+ * 每次现建正则：`replace` 会改写 /g 实例的 lastIndex，而变量展开是递归的
+ * （replace 回调里还会再替换一次），共用一个实例等于依赖引擎对重入的处理。
+ */
+function placeholderPattern(): RegExp {
+  return /\{\{\s*([a-zA-Z][\w-]*)\s*\}\}/g;
+}
+
+/** 第一遍解析：variables 先按变量读出来，entries 原样放行——替换完变量再按 EntrySchema 严格校验。 */
 const KbFileSchema = z.object({
-  entries: z.array(EntrySchema).min(1),
+  variables: z.record(z.string(), z.unknown()).optional(),
+  entries: z.array(z.unknown()).min(1),
 });
 
 export type KbEntry = z.infer<typeof EntrySchema>;
@@ -103,11 +117,85 @@ function renderBlock(entries: KbEntry[]): string {
   return out.join("\n").trimEnd();
 }
 
+function placeholder(name: string): string {
+  return `{{${name}}}`;
+}
+
+function undefinedVariable(file: string, name: string): Error {
+  return new Error(`${file}: 变量 ${placeholder(name)} 未定义，请先在顶层 variables 里补上`);
+}
+
+/**
+ * 变量值只能是字符串。不加引号的 `5.0`、`0791` 会被 YAML 当成数字，静默丢掉小数和前导零，
+ * 而变量是直接拼给同学看的，宁可启动时报错让人加引号。
+ */
+function variableText(file: string, name: string, value: unknown): string {
+  if (typeof value === "string") return value;
+  throw new Error(
+    `${file}: 变量 ${placeholder(name)} 的值被 YAML 解析成了 ${typeof value}（${String(value)}），` +
+      `请加引号写成 "${String(value)}"`,
+  );
+}
+
+/** 展开 variables 自身：变量可以引用变量，循环引用直接报错。 */
+function expandVariables(raw: Record<string, unknown>, file: string): Map<string, string> {
+  const done = new Map<string, string>();
+  const stack: string[] = [];
+
+  const expand = (name: string): string => {
+    const cached = done.get(name);
+    if (cached !== undefined) return cached;
+    const value = raw[name];
+    if (value === undefined) throw undefinedVariable(file, name);
+    const seenAt = stack.indexOf(name);
+    if (seenAt !== -1) {
+      throw new Error(`${file}: 变量循环引用 ${[...stack.slice(seenAt), name].map(placeholder).join(" → ")}`);
+    }
+    stack.push(name);
+    // trim 掉块标量 `|` 自带的收尾换行，否则变量拼进句子中间会把句子断成两行。
+    const expanded = variableText(file, name, value)
+      .trim()
+      .replace(placeholderPattern(), (_whole, ref: string) => expand(ref));
+    stack.pop();
+    done.set(name, expanded);
+    return expanded;
+  };
+
+  for (const name of Object.keys(raw)) expand(name);
+  return done;
+}
+
+/** 替换 entries 里所有字符串的占位符。没解析掉的占位符一律报错——否则花括号会原样发给同学。 */
+function substituteVariables(value: unknown, vars: Map<string, string>, file: string): unknown {
+  if (typeof value === "string") {
+    const replaced = value.replace(placeholderPattern(), (_whole, name: string) => {
+      const resolved = vars.get(name);
+      if (resolved === undefined) throw undefinedVariable(file, name);
+      return resolved;
+    });
+    const at = replaced.indexOf("{{");
+    if (at !== -1) {
+      const snippet = (replaced.slice(at, at + 30).split("\n")[0] ?? "").trim();
+      throw new Error(
+        `${file}: 占位符「${snippet}」没解析成功；变量名只能用字母、数字、下划线、短横线，且必须在顶层 variables 里定义`,
+      );
+    }
+    return replaced;
+  }
+  if (Array.isArray(value)) return value.map((item) => substituteVariables(item, vars, file));
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, substituteVariables(item, vars, file)]));
+  }
+  return value;
+}
+
 export function loadKnowledgeBase(path: string): KnowledgeBase {
   const raw = readFileSync(path, "utf8");
   const doc = KbFileSchema.parse(parseYaml(raw));
+  const vars = expandVariables(doc.variables ?? {}, path);
+  const entries = z.array(EntrySchema).min(1).parse(substituteVariables(doc.entries, vars, path));
   const version = versionOf(raw);
-  const block = renderBlock(doc.entries);
-  const systemPrompt = `${SYSTEM_RULES}\n\n# 知识库（版本 kb-${version}，共 ${doc.entries.length} 条）\n\n${block}\n`;
-  return { version, entries: doc.entries, block, systemPrompt };
+  const block = renderBlock(entries);
+  const systemPrompt = `${SYSTEM_RULES}\n\n# 知识库（版本 kb-${version}，共 ${entries.length} 条）\n\n${block}\n`;
+  return { version, entries, block, systemPrompt };
 }
