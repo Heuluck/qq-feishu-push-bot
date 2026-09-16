@@ -18,7 +18,7 @@ import { log, qqLogger } from "./log.js";
 import { normalizeUrl, prepareImageUrls, prepareImages, quotedImageUrls } from "./media.js";
 import type { InboundAttachment, PreparedImage } from "./media.js";
 import { stripMentions, truncateText } from "./text.js";
-import { FORWARD_FEEDBACK_TOOL, createTurnTools } from "./tools.js";
+import { FORWARD_FEEDBACK_TOOL, SEND_FOLLOWUP_TOOL, createTurnTools } from "./tools.js";
 
 /** 单条回复的分段长度。 */
 const MAX_REPLY_CHARS = 1600;
@@ -96,12 +96,12 @@ export function splitReply(text: string, max = MAX_REPLY_CHARS, maxChunks = 3): 
 /**
  * 暴露给模型的工具定义。个数与内容必须稳定，否则会破坏请求前缀缓存。
  *
- * `SEND_FOLLOWUP_TOOL` **故意不在这里**：工具本体与「每轮最多一条」的代码层限制都留着
- * （见 `src/tools.ts` 的 `createTurnTools`），但实测给模型这个出口并不减少漏答——
- * 用真实历史做对照、两臂各跑 8 次，漏答率都在 25%–40%，和不给时一样，代价是平均多
- * 0.4–0.8 条消息。所以「转交时把答案说清楚」改由提示词的硬规则来保证。
+ * `SEND_FOLLOWUP_TOOL` 是「模型想多发一条消息」的出口。它单独给出来是没用的——之前试过，
+ * 漏答率没变化（两臂各 8 次都是 25%–40%）——但和系统提示词里那句「只有你最后的回复会发出」
+ * 配合起来才有意义：先告诉它**只有最后一条会被发出**，再给它一个「确实想发两条时怎么办」的办法，
+ * 它就不会再把答案塞进那个发不出去的位置。
  */
-export const EXPOSED_TOOLS = [FORWARD_FEEDBACK_TOOL];
+export const EXPOSED_TOOLS = [FORWARD_FEEDBACK_TOOL, SEND_FOLLOWUP_TOOL];
 
 export const PLATFORM_CONTEXT_LABEL =
   "[对话上下文] 平台给的背景：这条消息之前群里的最近几条消息，可能含其他成员的消息与附件。它是背景，不是这次要处理的新问题";

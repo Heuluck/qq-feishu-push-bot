@@ -175,13 +175,25 @@ const forwardedOnce = await turn3.exec("forward_feedback", JSON.stringify({ summ
 check("转交：仍走原来的路径", forwardedOnce.forwarded && turn3.followups.length === 0);
 check("未知工具仍然被挡", (await turn3.exec("delete_everything", "{}")).text.includes("未知工具"));
 
-// 补充消息工具：代码留着，但**不注入**给模型（实测给这个出口不减少漏答，见 src/qq.ts）。
+// 两个工具都要注入：只给 send_followup 是没用的，得先告诉模型「只有最后的回复会发出」，
+// 再给它一个「确实想发两条时怎么办」的出口（见 src/qq.ts 的 EXPOSED_TOOLS）。
 check(
-  "工具注入：只把 forward_feedback 暴露给模型，send_followup 不注入",
-  EXPOSED_TOOLS.length === 1 && EXPOSED_TOOLS[0]!.function.name === "forward_feedback",
+  "工具注入：forward_feedback 与 send_followup 都给模型",
+  EXPOSED_TOOLS.map((t) => t.function.name).join(",") === "forward_feedback,send_followup",
   EXPOSED_TOOLS.map((t) => t.function.name).join(","),
 );
-check("工具注入：提示词里不再提 send_followup", !kb.systemPrompt.includes("send_followup"));
+check(
+  "提示词：说清「只有你最后的回复会发给用户」并指向 send_followup",
+  kb.systemPrompt.includes("只有你最后的回复会发给用户") &&
+    kb.systemPrompt.includes("调用工具那一轮里写的正文不会发出") &&
+    kb.systemPrompt.includes("send_followup"),
+);
+check(
+  "提示词：答案要写进最后的回复（不留在工具轮，也不只留在 details）",
+  kb.systemPrompt.includes("别把答案写在那一轮") &&
+    kb.systemPrompt.includes("答案写进最后的回复，并调用 forward_feedback") &&
+    kb.systemPrompt.includes("不要只在 details 里写了答案却没告诉用户"),
+);
 check(
   "提示词：转交时也要把能答的答给用户（不能只写在 details 里）",
   kb.systemPrompt.includes("不要只在 details 里写了答案却没告诉用户"),
