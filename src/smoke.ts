@@ -16,6 +16,7 @@ import { prepareImageUrls, quotedImageUrls, resizeImageBuffer } from "./media.js
 import { buildUserText, ensureQuotaNotice, splitReply } from "./qq.js";
 import { FILE_PATTERNS, dayKey, migrateLegacyForwards, monthKey, pruneByAge, stampKey } from "./retention.js";
 import { stripMentions, truncateText } from "./text.js";
+import { extractTextToolCalls, runTextToolCalls } from "./toolmarkup.js";
 import { FORWARD_FEEDBACK_TOOL, ForwardFeedbackArgs } from "./tools.js";
 
 const cfg = {
@@ -409,6 +410,38 @@ check(
   JSON.stringify(history.recentImageUrls("G7", "U1")) === JSON.stringify(["https://x/shot.png"]),
 );
 check("缓冲图片：默认上限取自 IMG_CONTEXT_MAX_COUNT", history.recentImageUrls("G7", "U1").length <= historyCfg.IMG_CONTEXT_MAX_COUNT);
+
+// 10. 正文形态的工具调用（真实泄漏样本）
+const leaked = `版本号我可能记岔了，同学以 App「关于」页显示的为准——显示 5.16.0 那就不是旧版喵。
+
+<||DSML||calls>
+<||DSML||invoke name="forward_feedback">
+<||DSML||parameter name="summary" string="true">用户Heuluck反馈群文件版本号与客服说法不一致</||DSML||parameter>
+<||DSML||parameter name="details" string="true">**现象**：用户截图 App「关于」页显示当前版本 5.16.0。</||DSML||parameter>
+</||DSML||invoke>
+</||DSML||calls>`;
+
+const parsedLeak = extractTextToolCalls(leaked);
+check("工具标记：解析出调用名", parsedLeak.calls[0]?.name === "forward_feedback", parsedLeak.calls.map((c) => c.name).join(","));
+check(
+  "工具标记：解析出参数",
+  (JSON.parse(parsedLeak.calls[0]?.argsJson ?? "{}") as Record<string, string>)["summary"]?.startsWith("用户Heuluck"),
+);
+check(
+  "工具标记：正文里不再残留 DSML",
+  !parsedLeak.cleaned.includes("DSML") && !parsedLeak.cleaned.includes("forward_feedback"),
+  JSON.stringify(parsedLeak.cleaned.slice(0, 40)),
+);
+check("工具标记：给用户的正文保留下来", parsedLeak.cleaned.includes("版本号我可能记岔了"));
+
+let executed: string[] = [];
+const runResult = await runTextToolCalls(leaked, async (name, argsJson) => {
+  executed.push(`${name}:${(JSON.parse(argsJson) as Record<string, string>)["summary"] ?? ""}`);
+  return { text: "已成功转交人工处理。", forwarded: true };
+});
+check("工具标记：调用被真的执行", executed.length === 1 && runResult.forwarded, executed.join(","));
+check("工具标记：无标记时不误判", extractTextToolCalls("课表不显示可以先连校园网。").calls.length === 0);
+check("工具标记：内部标记【必须告知】也会被清掉", !extractTextToolCalls("【必须告知】今天图片额度用完了。").cleaned.includes("【必须告知】"));
 
 await history.flush();
 rmSync("data/smoke-tmp", { recursive: true, force: true });

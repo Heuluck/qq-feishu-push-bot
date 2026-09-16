@@ -6,6 +6,7 @@ import type {
 } from "openai/resources/chat/completions";
 import type { Config } from "./config.js";
 import { log } from "./log.js";
+import { runTextToolCalls } from "./toolmarkup.js";
 
 export interface ToolExecutionResult {
   /** 回填给模型的工具结果文本。 */
@@ -92,6 +93,16 @@ export class LlmClient {
       }
       lastText = (choice.content ?? "").trim();
     }
+
+    // 正文形态的工具调用：模型有时不返回结构化 tool_calls，而是把调用写进正文
+    // （原生 <||DSML||…> 标记或散文式一行）。必须解析并真的执行，同时把标记从回复里剔除，
+    // 否则既会把内部信息发给用户，又会出现「说已转交但其实没转交」。
+    const textCalls = await runTextToolCalls(lastText, (name, argsJson) => input.execTool(name, argsJson));
+    if (textCalls.forwarded) forwarded = true;
+    if (textCalls.calls.length > 0) {
+      log.warn("llm", `模型把工具调用写成了正文，已解析并执行 ${textCalls.calls.length} 个：${textCalls.calls.map((c) => c.name).join(", ")}`);
+    }
+    lastText = textCalls.text;
 
     // 模型没给出任何对用户说的话（常见于它接不上这个话题，比如看不到上文）：
     // 不再回一句写死的文案，而是明确要求它自己组织一句。
