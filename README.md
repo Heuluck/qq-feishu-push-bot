@@ -61,6 +61,16 @@ docker compose restart      # 改完 kb/kb.yaml 后重启生效
 
 `docker-compose.yml` 里没有 `ports:`，只走出站连接；内存上限 320MB。
 
+如果本机是 arm64 而服务器是 x86_64（或者服务器内存很小、不适合跑 `npm ci` + `tsc`），用 `deploy.sh`：它在本机交叉编译出目标架构的镜像、连代码一起推上去，服务器只负责 `docker load` 和 `up`，全程不构建。整个流程只开两条 SSH 连接（每条都要按一次硬件密钥的指纹，所以刻意压到最少）。
+
+```bash
+./deploy.sh            # 构建 → 上传 → 重启 → 自检
+./deploy.sh --no-build # 只同步代码并重启（改了挂载的 kb/kb.yaml 时用）
+./deploy.sh --logs     # 部署完直接跟日志
+```
+
+它不会在服务器上执行 `docker compose build`，所以那台机器多小都能跑；但这也意味着改了 `src/` 之后必须在**本机**重新部署，服务器上那份源码只是留档。
+
 ## 需要开通的权限
 
 ### QQ 开放平台（[q.qq.com](https://q.qq.com)）
