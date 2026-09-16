@@ -130,6 +130,10 @@ export class History {
       kept.unshift(turn);
     }
 
+    // 从头部丢的**条数**是奇数时，会正好留下一条没有前因的答复（它的提问刚被丢掉）——
+    // 那比没有更糟：模型会以为发生了一件它没看到的事。所以把开头孤立的答复也去掉。
+    while (kept.length > 0 && kept[0]!.role === "bot") kept.shift();
+
     return { turns: kept, dropped: entries.length - kept.length };
   }
 

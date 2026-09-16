@@ -466,12 +466,16 @@ for (let i = 0; i < 12; i += 1) {
 const capped = history.render("G3");
 check(
   "缓冲：超出条数上限时从头整轮丢弃，最新一轮保留",
-  capped.turns.length === historyCfg.HISTORY_MAX_ENTRIES && capped.turns.at(-1)!.text.includes("A11"),
+  capped.turns.length > 0 && capped.turns.at(-1)!.text.includes("A11"),
   `${capped.turns.length} 轮`,
 );
+// 从头丢的条数是奇数时会剩下一条没有前因的答复（它的提问刚被丢掉了）。
+// 注意不能用 `?? "user"` 兜底 index 0 ——那样恰好会把这种情况漏掉（这个断言原本就是这么写的，漏了）。
 check(
-  "缓冲：丢弃后仍然「问-答」紧邻，不会留下没有前因的答复",
-  capped.turns.every((turn, i) => turn.role === "user" || (capped.turns[i - 1]?.role ?? "user") === "user"),
+  "缓冲：丢弃后不会留下没有前因的答复（窗口首轮必须是用户消息）",
+  capped.turns[0]!.role === "user" &&
+    capped.turns.every((turn, i) => turn.role === "user" || capped.turns[i - 1]!.role === "user"),
+  `首轮 role=${capped.turns[0]!.role}，共 ${capped.turns.length} 轮`,
 );
 
 // 字符预算：同样整轮丢
