@@ -323,14 +323,15 @@ export function createQqBot(deps: QqDeps): QQBot {
       let historyImageCount = 0;
       for (const turn of rendered.turns) {
         const role = turn.role === "bot" ? ("assistant" as const) : ("user" as const);
+        const toolRounds = turn.toolRounds.length > 0 ? { toolRounds: turn.toolRounds } : {};
         if (turn.images.length === 0) {
-          historyTurns.push({ role, parts: [{ text: turn.text }] });
+          historyTurns.push({ role, parts: [{ text: turn.text }], ...toolRounds });
           continue;
         }
         const batch = await prepareImageUrls(takeNew(turn.images), cfg, turn.images.length, newSlots());
         account(batch);
         historyImageCount += batch.images.length;
-        historyTurns.push({ role, parts: [{ text: turn.text }, ...toParts(batch.images)] });
+        historyTurns.push({ role, parts: [{ text: turn.text }, ...toParts(batch.images)], ...toolRounds });
       }
 
       // 4) 平台上下文里的图片：平台那段文本拼不出轮次，只能整段当背景，图紧跟在说明之后
@@ -407,12 +408,19 @@ export function createQqBot(deps: QqDeps): QQBot {
       for (const chunk of splitReply(reply, MAX_REPLY_CHARS, cfg.REPLY_MAX_CHUNKS)) {
         await bot.sendText(msg.replyTarget, chunk);
       }
-      // 回复也要进历史：用户接着上一轮的答复追问时，模型得知道自己说过什么。
-      history.record(msg.groupOpenid ?? "", { at: Date.now(), role: "bot", content: reply });
+      // 回复与**这一轮做过的工具调用**都要进历史：前者让用户接着追问时模型知道自己说过什么，
+      // 后者让它知道自己已经转过人工、转过谁——少了它就会出现同一个问题重复转交。
+      history.record(msg.groupOpenid ?? "", {
+        at: Date.now(),
+        role: "bot",
+        content: reply,
+        ...(result.toolRounds.length > 0 ? { toolRounds: result.toolRounds } : {}),
+      });
       log.info(
         "qq",
-        `回复完成 ${Date.now() - started}ms｜转交=${result.forwarded}｜历史 ${historyTurns.length} 轮` +
-          `（历史图 ${historyImageCount} 张）｜本图 消息 ${prepared.images.length}/${attachments.length}` +
+        `回复完成 ${Date.now() - started}ms｜转交=${result.forwarded}｜工具轮 ${result.toolRounds.length}` +
+          `（${result.toolRounds.flatMap((r) => r.calls.map((c) => c.name)).join(",") || "无"}）` +
+          `｜历史 ${historyTurns.length} 轮（历史图 ${historyImageCount} 张）｜本图 消息 ${prepared.images.length}/${attachments.length}` +
           `、引用 ${fromQuote.images.length}/${quotedImages.length}｜新读 ${downloaded} 张` +
           `（缓存 ${prepared.cached + fromQuote.cached + fromContext.cached}）｜平台背景=${platformContext.text !== ""}`,
       );

@@ -24,6 +24,8 @@ export type MessagePart = { text: string } | { image: string };
 export interface LlmTurn {
   role: "user" | "assistant";
   parts: MessagePart[];
+  /** 这一轮里做过的工具调用。回放时要还原成 assistant(tool_calls) + tool 消息。 */
+  toolRounds?: ToolRound[];
 }
 
 export interface CompleteInput {
@@ -38,6 +40,30 @@ export interface CompleteInput {
 export interface CompleteResult {
   text: string;
   forwarded: boolean;
+  /** 本轮真的执行过的工具调用，按发生顺序。调用方要把它写进对话缓冲。 */
+  toolRounds: ToolRound[];
+}
+
+/**
+ * 一次工具调用及其结果。
+ *
+ * 字段必须原样保留（尤其是 provider 给的 `id`）：回放历史时要把这一轮重新拼成
+ * `assistant(tool_calls)` + `tool` 两个消息，只要和当时逐字节一致，请求前缀就还能命中缓存。
+ * 只记「已转交」这类文本是不够的——模型看不到自己**调用过什么**，就会对同一个问题重复转交人工。
+ */
+export interface ToolCallRecord {
+  id: string;
+  name: string;
+  argsJson: string;
+  /** 工具执行结果原文。 */
+  result: string;
+}
+
+/** 一轮模型回复里的工具调用（同一条 assistant 消息可以带多个调用）。 */
+export interface ToolRound {
+  /** 那条 assistant 消息的正文（通常是空字符串，但有的模型会边说边调）。 */
+  content: string;
+  calls: ToolCallRecord[];
 }
 
 export class LlmClient {
@@ -81,6 +107,9 @@ export class LlmClient {
     const deadline = AbortSignal.timeout(this.cfg.LLM_DEADLINE_MS);
     let forwarded = false;
     let lastText = "";
+    // 只记**进了 messages 的那些**调用。补答（askForReply）与正文形态解析出来的调用都没进
+    // messages 数组，记进对话缓冲反而会让下一轮的前缀和这一轮对不上，所以不记。
+    const toolRounds: ToolRound[] = [];
 
     for (let round = 0; round < 2; round += 1) {
       const res = await this.client.chat.completions.create(
@@ -117,11 +146,19 @@ export class LlmClient {
           function: { name: call.function.name, arguments: call.function.arguments },
         })),
       });
+      const toolRound: ToolRound = { content: choice.content ?? "", calls: [] };
       for (const call of calls) {
         const result = await input.execTool(call.function.name, call.function.arguments);
         if (result.forwarded) forwarded = true;
         messages.push({ role: "tool", tool_call_id: call.id, content: result.text });
+        toolRound.calls.push({
+          id: call.id,
+          name: call.function.name,
+          argsJson: call.function.arguments,
+          result: result.text,
+        });
       }
+      toolRounds.push(toolRound);
       lastText = (choice.content ?? "").trim();
     }
 
@@ -145,7 +182,7 @@ export class LlmClient {
     }
     lastText = textCalls.text;
 
-    return { text: lastText, forwarded };
+    return { text: lastText, forwarded, toolRounds };
   }
 
   /**
@@ -214,6 +251,22 @@ export function buildMessages(input: CompleteInput, systemPrompt: string): ChatC
   const messages: ChatCompletionMessageParam[] = [{ role: "system", content: systemPrompt }];
   for (const turn of input.history) {
     if (turn.role === "assistant") {
+      // 工具轮要还原成当时的形状：assistant(tool_calls) + 每个调用一条 tool。
+      // id / 参数 / 结果都按原样回放，这样这轮请求的前缀和上一轮逐字节一致，缓存能继续往后接。
+      for (const round of turn.toolRounds ?? []) {
+        messages.push({
+          role: "assistant",
+          content: round.content,
+          tool_calls: round.calls.map((call) => ({
+            id: call.id,
+            type: "function" as const,
+            function: { name: call.name, arguments: call.argsJson },
+          })),
+        });
+        for (const call of round.calls) {
+          messages.push({ role: "tool", tool_call_id: call.id, content: call.result });
+        }
+      }
       // 机器人自己只发文本，不带图。
       messages.push({ role: "assistant", content: plainText(turn.parts) });
       continue;

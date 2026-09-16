@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "./config.js";
+import type { ToolRound } from "./llm.js";
 import { log } from "./log.js";
 import { truncateText } from "./text.js";
 
@@ -30,6 +31,14 @@ export interface HistoryEntry {
   content: string;
   /** 这条消息带的图片 URL，渲染时挂在**这一轮**上。 */
   imageUrls?: string[];
+  /**
+   * 机器人这一轮做过的工具调用（id、参数、结果都原样留着）。
+   *
+   * 只记回复文本是不够的：模型看不到自己**调用过什么**，就会对同一个问题重复转交人工
+   * （早期数据里同一个崩溃被转了两次）。回放时按原样拼回 assistant(tool_calls) + tool，
+   * 也保证了请求前缀与当时一致、缓存能继续往后接。
+   */
+  toolRounds?: ToolRound[];
 }
 
 /** 渲染给模型的一轮。 */
@@ -37,8 +46,10 @@ export interface HistoryTurn {
   role: "user" | "bot";
   /** 该轮要喂的图片 URL（原始形态，由调用方下载）。 */
   images: string[];
-  /** 已渲染好的文本：user 轮形如 `[15:08] Luck: 我也有这个问题`，bot 轮只有时间戳。 */
+  /** 已渲染好的文本：user 轮形如 `[15:08] 用户Luck: 我也有这个问题`，bot 轮是纯文本。 */
   text: string;
+  /** 机器人轮里做过的工具调用，原样透传。 */
+  toolRounds: ToolRound[];
 }
 
 export interface RenderedHistory {
@@ -116,7 +127,7 @@ export class History {
       // （实测问「第 1 张、第 2 张分别是什么颜色」会答错——模型没有「第几张」的概念）。
       // 用该轮的时间而不是序号：时间不随窗口滑动而变，序号会。
       const label = images.length === 0 ? "" : ` ［图：${hhmm(entry.at)}${images.length > 1 ? `（共 ${images.length} 张）` : ""}］`;
-      return { role: entry.role, images, text: `${text}${label}` };
+      return { role: entry.role, images, text: `${text}${label}`, toolRounds: entry.toolRounds ?? [] };
     });
 
     // 字符预算：从最新往前留，超了就**整轮**丢掉。

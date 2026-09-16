@@ -505,6 +505,31 @@ const reloaded = new History(historyCfg);
 await reloaded.init();
 check("缓冲：重启后仍能恢复近况", reloaded.render("G1").turns.some((t) => t.text.includes("没用了")));
 
+// 工具调用要能落盘再读回来（JSON 往返），否则重启后就「忘了自己转过人工」
+history.record("G11", { at: Date.now() - 60_000, role: "user", senderId: "U1", senderName: "甲", content: "帮我转人工" });
+history.record("G11", {
+  at: Date.now() - 50_000,
+  role: "bot",
+  content: "已经帮你转给负责的同学了。",
+  toolRounds: [{ content: "", calls: [{ id: "call_p1", name: "forward_feedback", argsJson: '{"summary":"用户甲要求转人工"}', result: "已转交人工处理。" }] }],
+});
+await history.flush();
+const reloaded2 = new History(historyCfg);
+await reloaded2.init();
+const persisted = reloaded2.render("G11", { speakerId: "U1" }).turns.find((t) => t.role === "bot");
+check(
+  "缓冲：工具调用能落盘再读回（id / 参数 / 结果都在）",
+  persisted?.toolRounds.length === 1 &&
+    persisted.toolRounds[0]!.calls[0]!.id === "call_p1" &&
+    persisted.toolRounds[0]!.calls[0]!.argsJson === '{"summary":"用户甲要求转人工"}' &&
+    persisted.toolRounds[0]!.calls[0]!.result === "已转交人工处理。",
+  JSON.stringify(persisted?.toolRounds),
+);
+check(
+  "缓冲：没有工具调用的轮次读回来是空数组（不会误报调用过）",
+  reloaded2.render("G11", { speakerId: "U1" }).turns.find((t) => t.role === "user")?.toolRounds.length === 0,
+);
+
 const disabled = new History({ ...historyCfg, HISTORY_ENABLED: false } as unknown as Config);
 await disabled.init();
 disabled.record("G1", { at: Date.now(), role: "user", content: "不该被记录" });
@@ -591,6 +616,47 @@ check(
     { history: [{ role: "user", parts: [{ text: "[15:07] 用户A: 你好" }] }], userParts: [{ text: "问题：在吗" }], tool: fakeTool, execTool: async () => ({ text: "", forwarded: false }) },
     "S",
   )[1]!.content === "[15:07] 用户A: 你好",
+);
+
+// 历史里的工具调用必须原样回放：模型看不到自己调用过什么，就会对同一个问题重复转交人工。
+const toolHistory = [
+  { role: "user" as const, parts: [{ text: "[16:04] 用户Heuluck: 怎么崩了啊" }] },
+  {
+    role: "assistant" as const,
+    parts: [{ text: "先换成 5.16.0。这条我已经转给负责的同学了。" }],
+    toolRounds: [
+      {
+        content: "",
+        calls: [{ id: "call_x1", name: "forward_feedback", argsJson: '{"summary":"用户Heuluck反馈崩溃"}', result: "已转交人工处理（话题：crash）。" }],
+      },
+    ],
+  },
+];
+const withTools = buildMessages({ history: toolHistory, userParts: [{ text: "问题：帮我转人工" }], tool: fakeTool, execTool: async () => ({ text: "", forwarded: false }) }, "S");
+check(
+  "多轮组装：历史工具轮还原成 assistant(tool_calls) + tool，位置在答复正文之前",
+  withTools.map((m) => m.role).join(",") === "system,user,assistant,tool,assistant,user",
+  withTools.map((m) => m.role).join(","),
+);
+const replayed = withTools[2] as { tool_calls?: { id: string; function: { name: string; arguments: string } }[] };
+check(
+  "多轮组装：调用 id / 名字 / 参数原样回放（id 对不上会让请求非法）",
+  replayed.tool_calls?.[0]?.id === "call_x1" &&
+    replayed.tool_calls?.[0]?.function.name === "forward_feedback" &&
+    replayed.tool_calls?.[0]?.function.arguments === '{"summary":"用户Heuluck反馈崩溃"}',
+  JSON.stringify(replayed.tool_calls),
+);
+check(
+  "多轮组装：tool 结果的 tool_call_id 与调用配对",
+  (withTools[3] as { tool_call_id?: string }).tool_call_id === "call_x1" &&
+    withTools[3]!.content === "已转交人工处理（话题：crash）。",
+);
+check(
+  "多轮组装：没有工具调用的轮次不会凭空多出 tool 消息",
+  buildMessages(
+    { history: [{ role: "assistant", parts: [{ text: "直接答复" }] }], userParts: [{ text: "问题：x" }], tool: fakeTool, execTool: async () => ({ text: "", forwarded: false }) },
+    "S",
+  ).map((m) => m.role).join(",") === "system,assistant,user",
 );
 
 // 11. 同群串行队列：并发消息不能读到「有问题、还没答复」的中间态
