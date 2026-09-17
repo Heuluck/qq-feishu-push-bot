@@ -56,6 +56,13 @@ entries:
     answer: |
       课表每日同步，刚选退课需要等待明天同步，请以教务系统为准。可对比教务系统（{{jwpt}}）-「学期理论课表」查看是否确有此课。{{jwpt-help}}
 
+  - id: major-change-not-sync
+    title: 转专业后资料未同步
+    keywords: [转专业]
+    route: forward
+    forward_hint: |
+      请稍后联系负责的同学，提供原学院和班级、现学院和班级、学号、现辅导员名字
+
   - id: download
     title: 下载南大家园
     keywords: [下载, 更新]
