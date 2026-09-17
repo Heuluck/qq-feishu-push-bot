@@ -211,6 +211,19 @@ check(
   kb.systemPrompt.includes("不要只在 details 里写了答案却没告诉用户"),
 );
 check("提示词：禁止在 details 里写「已回复」这类声明", kb.systemPrompt.includes("不要写「已回复」「已告知」这类声明"));
+// 线上真实事故：用户补上你上一轮索要的版本/机型后，模型只写了「我已经补给负责的同学」，
+// 整轮却没调用 forward_feedback。这句规则是那条路径的守卫（保持简短，别把提示词写肥）。
+check(
+  "提示词：用户补充已转交问题的材料时，仍要再转交一次",
+  kb.systemPrompt.includes("仍要再转交一次"),
+);
+// 上下文里每一轮都是 user（DeepSeek 等不认 messages 的 name 字段），只能靠文本前缀区分发言人。
+// 只写「注意区分不同同学」：写「别人问的也要一并答」会回头掺和已处理完的事，
+// 写「区分哪个同学在问」又会把「谁在问」这件事变成要它判断的问题（内心戏就是从那儿漏出来的）。
+check(
+  "提示词：说清 user 轮是很多人、注意区分不同同学",
+  kb.systemPrompt.includes("## 群里是很多个同学") && kb.systemPrompt.includes("注意区分不同同学"),
+);
 
 // 3. 图片缩放
 const big = await sharp({
