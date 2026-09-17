@@ -91,7 +91,7 @@ entries:
     keywords: [神秘商店]
     route: answer
     answer: |
-      可以兑换神秘物品的地方——可以关注一下我们的后续活动
+      可以用兑换码兑换神秘物品的地方——可以关注一下我们的后续活动
 
   - id: electric-app-missing
     title: 电费查询应用不见了
