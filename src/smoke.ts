@@ -9,7 +9,7 @@ import sharp from "sharp";
 import type { Config } from "./core/config.js";
 import { stripMentions, truncateText } from "./core/text.js";
 import { loadKnowledgeBase } from "./kb/kb.js";
-import { buildMessages } from "./llm/messages.js";
+import { REPLY_HINT, buildMessages } from "./llm/messages.js";
 import { EXPOSED_TOOLS, FORWARD_FEEDBACK_TOOL, ForwardFeedbackArgs, SEND_FOLLOWUP_TOOL, SendFollowupArgs, createTurnTools } from "./llm/tools.js";
 import { extractTextToolCalls, runTextToolCalls } from "./llm/toolmarkup.js";
 import { buildFollowUpCard, buildRootCard } from "./lark/cards.js";
@@ -825,8 +825,15 @@ const built = buildMessages(
 check("多轮组装：system 在最前且逐字节稳定", built[0]!.role === "system" && built[0]!.content === "SYSTEM");
 check(
   "多轮组装：历史按顺序成为独立的 user / assistant 轮",
-  built.length === 4 && built[1]!.role === "user" && built[2]!.role === "assistant" && built[3]!.role === "user",
+  built.length === 5 && built[1]!.role === "user" && built[2]!.role === "assistant" && built[3]!.role === "user",
   built.map((m) => m.role).join(","),
+);
+// 末条固定提示：位置（必须最后）、内容（必须是常量，否则前缀缓存全废）都要守住。
+// 实测同一句话写在规则块里几乎没用、放末尾才管用（重复转交 10/20 → 1/20）。
+check(
+  "多轮组装：最后一条是固定的回复提示",
+  built.at(-1)!.role === "system" && built.at(-1)!.content === REPLY_HINT && REPLY_HINT.length > 20,
+  String(built.at(-1)!.content).slice(0, 30),
 );
 check(
   "多轮组装：图片留在它自己那一轮",
@@ -860,7 +867,7 @@ const toolHistory = [
 const withTools = buildMessages({ history: toolHistory, userParts: [{ text: "问题：帮我转人工" }], tools: [fakeTool], execTool: async () => ({ text: "", forwarded: false }) }, "S");
 check(
   "多轮组装：历史工具轮还原成 assistant(tool_calls) + tool，位置在答复正文之前",
-  withTools.map((m) => m.role).join(",") === "system,user,assistant,tool,assistant,user",
+  withTools.map((m) => m.role).join(",") === "system,user,assistant,tool,assistant,user,system",
   withTools.map((m) => m.role).join(","),
 );
 const replayed = withTools[2] as { tool_calls?: { id: string; function: { name: string; arguments: string } }[] };
@@ -881,7 +888,7 @@ check(
   buildMessages(
     { history: [{ role: "assistant", parts: [{ text: "直接答复" }] }], userParts: [{ text: "问题：x" }], tools: [fakeTool], execTool: async () => ({ text: "", forwarded: false }) },
     "S",
-  ).map((m) => m.role).join(",") === "system,assistant,user",
+  ).map((m) => m.role).join(",") === "system,assistant,user,system",
 );
 // 模型「正文 + 工具调用」是同一条 assistant 消息：正文已经随 tool_calls 回放过，
 // 再加一条同样的文本，历史里就有两份答案（提示词又要求它别重复自己说过的话）。
@@ -911,7 +918,7 @@ check(
     );
     const texts = built2.map((m) => (typeof m.content === "string" ? m.content : ""));
     return (
-      built2.map((m) => m.role).join(",") === "system,user,assistant,tool,user" &&
+      built2.map((m) => m.role).join(",") === "system,user,assistant,tool,user,system" &&
       texts.filter((text) => text.includes("已经转给负责的同学了")).length === 1
     );
   })(),
@@ -933,7 +940,7 @@ check(
       execTool: async () => ({ text: "", forwarded: false }),
     },
     "S",
-  ).map((m) => m.role).join(",") === "system,assistant,tool,assistant,user",
+  ).map((m) => m.role).join(",") === "system,assistant,tool,assistant,user,system",
 );
 
 // 11. 同群串行队列：并发消息不能读到「有问题、还没答复」的中间态

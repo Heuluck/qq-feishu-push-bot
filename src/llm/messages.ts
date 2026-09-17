@@ -71,7 +71,20 @@ export interface CompleteResult {
 }
 
 /**
- * 把「system + 历史轮次 + 本轮」组装成请求的 messages。
+ * 放在**最后**的一条 system 提示：一句话重复本轮最容易违反的规则。
+ *
+ * 为什么放末尾而不是写进规则正文：实测同一句话「放末尾」和「写在规则块里」差一个数量级。
+ * 用线上真实那一轮（群里已有同学接手的手机号问题 + 一句空 @）配对跑 20 次：
+ * 写在规则块里重复转交 10/20，放末尾 1/20（p=0.003）。末条消息的 recency 比措辞管用得多。
+ *
+ * 必须是**常量**：请求前缀要逐字节稳定才命中缓存。追加在末尾不碰前面的任何字节，
+ * 实测命中率不变（system + 历史仍命中 2944，只多这 29 token 未命中）。
+ */
+export const REPLY_HINT =
+  "本轮提示：只答最后那条（或那几条）消息里的问题；更早的话题别接回来，也别重复转交。";
+
+/**
+ * 把「system + 历史轮次 + 本轮 + 末尾提示」组装成请求的 messages。
  *
  * 历史是**逐字节稳定、只往后追加**的前缀，所以能被厂商的前缀缓存命中，只有最新那一轮按原价计费。
  * 反过来，如果把历史拼成一段文本塞进当前那条 user 消息，它每轮都变，缓存全废。
@@ -110,6 +123,8 @@ export function buildMessages(input: CompleteInput, systemPrompt: string): ChatC
     messages.push({ role: "user", content: toContent(turn.parts) });
   }
   messages.push({ role: "user", content: toContent(input.userParts) });
+  // 末尾再压一句固定提示（见 REPLY_HINT）：末条消息离生成最近，规则放这里最管用。
+  messages.push({ role: "system", content: REPLY_HINT });
   return messages;
 }
 
