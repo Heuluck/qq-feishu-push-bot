@@ -98,6 +98,8 @@ docker compose restart      # 改完 kb/kb.yaml 后重启生效
 
 如果本机是 arm64 而服务器是 x86_64（或者服务器内存很小、不适合跑 `npm ci` + `tsc`），用 `deploy.sh`：它在本机交叉编译出目标架构的镜像、连代码一起推上去，服务器只负责 `docker load` 和 `up`，全程不构建。整个流程只开两条 SSH 连接（每条都要按一次硬件密钥的指纹，所以刻意压到最少）。
 
+> `deploy.sh` **不在仓库里**：脚本里写着服务器地址与远程目录，早已加进 `.gitignore`（历史上那份也已从所有提交里清掉）。它只存在于部署者的本机与服务器上，新克隆的人要按自己的机器写一份：`SERVER` / `REMOTE_DIR` 可用环境变量覆盖，其余是 `docker buildx` + `ssh` + `docker load` 的常规流程。
+
 ```bash
 ./deploy.sh            # 全量：构建 → 上传 → 重建容器 → 自检
 ./deploy.sh --kb       # 只更新知识库并重启（1 条连接、几秒；改 kb/kb.yaml 时用这个）
