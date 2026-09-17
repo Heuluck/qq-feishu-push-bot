@@ -15,7 +15,7 @@ import { extractTextToolCalls, runTextToolCalls } from "./llm/toolmarkup.js";
 import { buildFollowUpCard, buildRootCard } from "./lark/cards.js";
 import { topicKey } from "./lark/forwarder.js";
 import { splitContextAttachments } from "./qq/context.js";
-import { clearPreparedImageCache, prepareImages, prepareImageUrls, quotedImageUrls, resizeImageBuffer } from "./qq/media.js";
+import { clearPreparedImageCache, isAllowedImageUrl, prepareImages, prepareImageUrls, quotedImageUrls, resizeImageBuffer } from "./qq/media.js";
 import {
   buildUserText,
   ensureQuotaNotice,
@@ -255,6 +255,8 @@ check(
   `mime=${smallOut.mime}，字节与原图一致`,
 );
 check("超限 PNG 会重编码为 JPEG", bigOut.mime === "image/jpeg");
+check("图片地址：允许 QQ HTTPS 子域名", isAllowedImageUrl("https://multimedia.nt.qq.com.cn/download?fileid=x"));
+check("图片地址：拒绝非 HTTPS 或伪造域名", !isAllowedImageUrl("http://multimedia.nt.qq.com.cn/x") && !isAllowedImageUrl("https://qq.com.evil.example/x"));
 
 // 4. 上下文解析（样本取自真实平台推送）
 const rawContext = `=== 消息 1 ===

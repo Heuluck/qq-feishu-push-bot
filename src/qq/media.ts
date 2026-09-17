@@ -95,6 +95,19 @@ export interface PrepareImagesResult {
 }
 
 const FETCH_TIMEOUT_MS = 15_000;
+const MAX_REDIRECTS = 3;
+
+export function isAllowedImageUrl(value: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "https:" || url.username !== "" || url.password !== "" || url.port !== "") return false;
+  const hostname = url.hostname.toLowerCase();
+  return ["qq.com", "qq.com.cn"].some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+}
 
 /** QQ 返回的附件 URL 偶尔缺少协议前缀。 */
 export function normalizeUrl(url: string): string {
@@ -102,13 +115,24 @@ export function normalizeUrl(url: string): string {
 }
 
 async function fetchBytes(url: string, maxBytes: number): Promise<Buffer> {
-  const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), redirect: "follow" });
-  if (!res.ok) throw new Error(`下载失败 HTTP ${res.status}`);
-  const declared = Number(res.headers.get("content-length") ?? "0");
-  if (declared > maxBytes) throw new Error(`图片过大（${declared} 字节）`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.byteLength > maxBytes) throw new Error(`图片过大（${buf.byteLength} 字节）`);
-  return buf;
+  let current = normalizeUrl(url);
+  for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
+    if (!isAllowedImageUrl(current)) throw new Error("图片地址不是受信任的 QQ HTTPS 地址");
+    const res = await fetch(current, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), redirect: "manual" });
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get("location");
+      if (!location || redirects === MAX_REDIRECTS) throw new Error("图片重定向次数过多或缺少目标地址");
+      current = new URL(location, current).toString();
+      continue;
+    }
+    if (!res.ok) throw new Error(`下载失败 HTTP ${res.status}`);
+    const declared = Number(res.headers.get("content-length") ?? "0");
+    if (declared > maxBytes) throw new Error(`图片过大（${declared} 字节）`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.byteLength > maxBytes) throw new Error(`图片过大（${buf.byteLength} 字节）`);
+    return buf;
+  }
+  throw new Error("图片重定向次数过多");
 }
 
 /**
@@ -187,6 +211,10 @@ export async function prepareImageUrls(
   let chargedNew = 0;
   for (const url of urls.slice(0, max)) {
     const key = normalizeUrl(url);
+    if (!isAllowedImageUrl(key)) {
+      log.warn("media", `图片地址已拒绝：仅允许 qq.com / qq.com.cn 的 HTTPS 地址`);
+      continue;
+    }
     const hit = cacheGet(key);
     if (hit !== undefined) {
       images.push({ ...hit, url });
