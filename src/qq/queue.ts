@@ -73,3 +73,22 @@ export function createArrivalTracker(): ArrivalTracker {
 export function needsQuote(arrivals: ArrivalTracker, groupId: string, ownSeq: unknown): boolean {
   return typeof ownSeq === "number" && arrivals.hasNewArrival(groupId, ownSeq);
 }
+
+/**
+ * 机器人自己发出一条群消息后补记一笔到达。
+ *
+ * **自己发的消息同样会把回复顶离那条 @ 消息**：两个人前后脚 @ 机器人时，前一个人的答复先发出去，
+ * 后一个人的答复就落在机器人的上一条回复下面，看不出在回谁。平台确实会把机器人自己发的消息回推
+ * （`senderIsBot`），但那条被 SDK 的 `messageFilter` 挡在到达簿记之前，所以不能只数入站事件——
+ * 在这里按「真的发出去了」补记，不依赖回推。
+ *
+ * 发送失败不记：那条消息没进群。抛出照常往外抛，由调用方决定怎么兜底。
+ */
+export async function trackOwnMessage(
+  arrivals: ArrivalTracker,
+  groupId: string,
+  send: () => Promise<unknown>,
+): Promise<void> {
+  await send();
+  arrivals.mark(groupId);
+}

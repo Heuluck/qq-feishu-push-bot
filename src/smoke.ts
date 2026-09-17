@@ -23,7 +23,7 @@ import {
   sendMainReply,
   splitReply,
 } from "./qq/reply.js";
-import { createArrivalTracker, createSerialQueue, needsQuote } from "./qq/queue.js";
+import { createArrivalTracker, createSerialQueue, needsQuote, trackOwnMessage } from "./qq/queue.js";
 import { History } from "./store/history.js";
 import { Limits } from "./store/limits.js";
 import { FILE_PATTERNS, dayKey, migrateLegacyForwards, monthKey, pruneByAge, stampKey } from "./store/retention.js";
@@ -279,6 +279,19 @@ const mineB = otherGroup.mark("G1");
 otherGroup.mark("G2");
 check("引用判断：别的群进消息不算这个群的新消息", !needsQuote(otherGroup, "G1", mineB));
 check("引用判断：没拿到自己的序号时不引用", !needsQuote(otherGroup, "G1", undefined));
+
+// 机器人自己发出去的消息同样会把答复顶离那条 @ 消息：两个人前后脚 @ 时，先回谁、后回谁，
+// 后一个人的答复就落在机器人的上一条回复下面。平台回推的那条被 messageFilter 按 senderIsBot
+// 挡掉了，所以在发送成功后补记一笔（这正是漏掉过的那一半）。
+const ownSend = createArrivalTracker();
+const mineC = ownSend.mark("G1");
+await trackOwnMessage(ownSend, "G1", async () => "sent");
+check("引用判断：机器人自己发出去的消息也算新消息", needsQuote(ownSend, "G1", mineC));
+const mineD = ownSend.mark("G1");
+await trackOwnMessage(ownSend, "G1", async () => {
+  throw new Error("网络错误");
+}).catch(() => undefined);
+check("引用判断：发送失败不记（那条消息没进群）", !needsQuote(ownSend, "G1", mineD));
 
 const sent: string[] = [];
 const recording = (kind: string) => async (content: string): Promise<void> => {

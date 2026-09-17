@@ -36,7 +36,7 @@ import {
   sendMainReply,
   splitReply,
 } from "./reply.js";
-import { createArrivalTracker, createSerialQueue, needsQuote } from "./queue.js";
+import { createArrivalTracker, createSerialQueue, needsQuote, trackOwnMessage } from "./queue.js";
 
 export interface QqDeps {
   cfg: Config;
@@ -61,7 +61,8 @@ export function createQqBot(deps: QqDeps): QQBot {
   bot.use(errorHandler({ format: () => "抱歉，这边刚出了点小问题，麻烦再发一次喵~", rethrow: true }));
   bot.use(messageFilter({ skipSelfEcho: true, dedup: { windowMs: 30_000, maxSize: 2_000 } }));
   // 每条进来的群消息先记一笔（含不 @ 机器人的普通消息），发送前据此判断这期间群里有没有人插话。
-  // 放在 messageFilter 之后：机器人自己的回显与被去重的重复推送不算「新消息」。
+  // 放在 messageFilter 之后：被去重的重复推送不算新消息。机器人自己发出去的消息也**要**算，
+  // 但回推的那条在这里就被 senderIsBot 挡掉了，所以那条改在发送成功后补记（见 trackOwnMessage）。
   bot.use((ctx, next) => {
     const m = ctx.message;
     if (m.kind === "group") ctx.state["arrivalSeq"] = arrivals.mark(m.groupOpenid ?? "");
@@ -137,19 +138,23 @@ export function createQqBot(deps: QqDeps): QQBot {
 
     // 这条消息进来时的序号（上面那个中间件记的）。发送前拿它判断期间群里有没有人插话。
     const myArrivalSeq = ctx.state["arrivalSeq"];
+    const groupOpenid = msg.groupOpenid ?? "";
+    // 机器人自己发出去的每条群消息都补记一笔：它也把后来的答复顶离那条 @ 消息。
+    const sendOwn = (send: () => Promise<unknown>): Promise<void> => trackOwnMessage(arrivals, groupOpenid, send);
 
     // 同步申请配额：被拒时直接返回，不会下载图片、不会解析上下文、更不会调用模型。
     const decision = limits.reserve(msg.senderId, msg.groupOpenid);
     if (!decision.ok) {
       log.info("qq", `已限流（${decision.reason}）sender=${msg.senderId}`);
-      if (decision.message && decision.reason && limits.shouldNotify(msg.senderId, decision.reason)) {
-        await bot.sendText(msg.replyTarget, decision.message);
+      const notice = decision.message;
+      if (notice && decision.reason && limits.shouldNotify(msg.senderId, decision.reason)) {
+        await sendOwn(() => bot.sendText(msg.replyTarget, notice));
       }
       return;
     }
 
     // 同群串行：整段「读历史 → 调模型 → 写回复」不能被打断，否则后一条消息读到的是中间态。
-    await enqueue(msg.groupOpenid ?? "", async () => {
+    await enqueue(groupOpenid, async () => {
       const quote = ctx.state.quote as ResolvedQuote | undefined;
       const platformContext = quote?.text
         ? splitContextAttachments(quote.text, {
@@ -165,7 +170,7 @@ export function createQqBot(deps: QqDeps): QQBot {
 
       // 历史渲染成真正的多轮 messages，图挂在它到来的那一轮上。
       // 必须在记录本轮提问**之前**渲染，否则当前问题会在历史里出现两次。
-      const rendered = history.render(msg.groupOpenid ?? "", { speakerId: msg.senderId });
+      const rendered = history.render(groupOpenid, { speakerId: msg.senderId });
 
       // 群 openid 首次出现在日志里，方便填进 .env 的 QQ_GROUP_OPENID。
       log.info("qq", `收到群消息 group=${msg.groupOpenid ?? "?"} sender=${msg.senderId}`);
@@ -313,7 +318,7 @@ export function createQqBot(deps: QqDeps): QQBot {
       }
 
       // 记录本轮提问：放在渲染历史之后，当前问题才不会在历史里出现两次。
-      history.record(msg.groupOpenid ?? "", {
+      history.record(groupOpenid, {
         at: Date.now(),
         role: "user",
         senderId: msg.senderId,
@@ -354,21 +359,24 @@ export function createQqBot(deps: QqDeps): QQBot {
       );
       // 有补充消息时先给它留一条：主回复的分段数 + 补充消息要一起落在平台那 5 条以内。
       const maxMainChunks = Math.max(1, Math.min(cfg.REPLY_MAX_CHUNKS, MAX_PASSIVE_REPLIES - tools.followups.length));
-      // 从收到这条 @ 消息、到答案生成完毕，中间群里又有人说话 → 被动回复会飘在新消息上面，
-      // 群里看不出这句话是回谁的。这时给正文带上 message_reference，引用回那条 @ 消息。
+      // 从收到这条 @ 消息、到答案生成完毕，中间群里又有人说话（或机器人自己先回了别人）
+      // → 被动回复会飘在新消息上面，群里看不出这句话是回谁的。
+      // 这时给正文带上 message_reference，引用回那条 @ 消息。
       // 判断全在代码里做：模型不参与，也不需要它产出引用；补充消息不引用。
-      const quoteTrigger = needsQuote(arrivals, msg.groupOpenid ?? "", myArrivalSeq);
-      if (quoteTrigger) log.info("qq", "这期间群里又进了消息，回复将引用那条 @ 消息");
+      const quoteTrigger = needsQuote(arrivals, groupOpenid, myArrivalSeq);
+      if (quoteTrigger) log.info("qq", "这期间群里有新消息（有人插话或自己刚回过），回复将引用那条 @ 消息");
       await sendMainReply(
         {
-          plain: (content) => bot.sendText(msg.replyTarget, content),
+          plain: (content) => sendOwn(() => bot.sendText(msg.replyTarget, content)),
           quoted: (content) =>
-            bot.send({
-              target: msg.replyTarget,
-              msgType: MsgType.TEXT,
-              content,
-              messageReference: { message_id: msg.messageId },
-            }),
+            sendOwn(() =>
+              bot.send({
+                target: msg.replyTarget,
+                msgType: MsgType.TEXT,
+                content,
+                messageReference: { message_id: msg.messageId },
+              }),
+            ),
         },
         splitReply(reply, MAX_REPLY_CHARS, maxMainChunks),
         quoteTrigger,
@@ -377,12 +385,12 @@ export function createQqBot(deps: QqDeps): QQBot {
       for (const extra of tools.followups) {
         log.info("qq", `补充消息：${extra.slice(0, 60)}`);
         for (const chunk of splitReply(extra, MAX_REPLY_CHARS, 1)) {
-          await bot.sendText(msg.replyTarget, chunk);
+          await sendOwn(() => bot.sendText(msg.replyTarget, chunk));
         }
       }
       // 回复与**这一轮做过的工具调用**都要进历史：前者让用户接着追问时模型知道自己说过什么，
       // 后者让它知道自己已经转过人工、转过谁——少了它就会出现同一个问题重复转交。
-      history.record(msg.groupOpenid ?? "", {
+      history.record(groupOpenid, {
         at: Date.now(),
         role: "bot",
         content: reply,
