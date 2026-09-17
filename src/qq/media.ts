@@ -1,7 +1,7 @@
 import sharp from "sharp";
 import type { InboundMessage, QuotedAttachment } from "@tencent-connect/qqbot-nodejs";
-import type { Config } from "./config.js";
-import { log } from "./log.js";
+import type { Config } from "../core/config.js";
+import { log } from "../core/log.js";
 
 /** SDK 没有从根导出附件类型，这里从入站消息上推导，避免深引内部路径。 */
 export type InboundAttachment = NonNullable<InboundMessage["attachments"]>[number];
@@ -41,7 +41,7 @@ export interface PreparedImageBatch {
 /**
  * 处理好的图片在本进程内缓存。
  *
- * 历史里的图在每一轮都要重新交给模型（图留在它到来的那一轮，见 `src/history.ts`），
+ * 历史里的图在每一轮都要重新交给模型（图留在它到来的那一轮，见 `src/store/history.ts`），
  * 所以同一张截图一小时内会被问很多次。没有这层缓存，每一轮都要重新下载 + 缩放，
  * 而且会把「今天读了几张图」的额度反复扣掉——用户发一张截图聊三句就没额度了。
  */
@@ -145,12 +145,13 @@ export async function prepareImages(
   cfg: Config,
   max = cfg.IMG_MAX_COUNT,
   maxNew = Number.POSITIVE_INFINITY,
+  alreadyCharged: (key: string) => boolean = () => false,
 ): Promise<PrepareImagesResult> {
   const imageAtts = attachments.filter(
     (att) => typeof att.content_type === "string" && att.content_type.startsWith("image/") && typeof att.url === "string",
   );
   const picked = max > 0 ? imageAtts.slice(0, max) : [];
-  const prepared = await prepareImageUrls(picked.map((att) => att.url), cfg, max, maxNew);
+  const prepared = await prepareImageUrls(picked.map((att) => att.url), cfg, max, maxNew, alreadyCharged);
   return {
     images: prepared.images,
     skipped: imageAtts.length - prepared.images.length,
@@ -164,8 +165,11 @@ export async function prepareImages(
 /**
  * 按 URL 准备图片。用于三类来源：当前消息的附件、被引用消息的图片、以及历史轮次里该用户的图片。
  *
- * `max` 限制这一来源最多要几张；`maxNew` 限制其中最多**下载**几张——缓存命中的不受它约束，
+ * `max` 限制这一来源最多要几张；`maxNew` 限制其中最多**新计几张额度**——缓存命中的不受它约束，
  * 这样每日额度用完之后，之前读过的图仍然能正常出现在历史里。
+ * `alreadyCharged` 告诉这里「这张图今天已经计过额度」（key 是补全协议后的 URL）：那种图即使
+ * 缓存已被淘汰、需要重新下载，也不占用 `maxNew` 的名额——否则额度用完后，同一张旧图会被判成
+ * 「额度不足」而从历史里消失。额度本身由调用方按 `images[].url` 计（见 store/limits.ts）。
  * 处理结果按 URL 缓存，同一张图只下载一次。
  */
 export async function prepareImageUrls(
@@ -173,11 +177,14 @@ export async function prepareImageUrls(
   cfg: Config,
   max = cfg.IMG_MAX_COUNT,
   maxNew = Number.POSITIVE_INFINITY,
+  alreadyCharged: (key: string) => boolean = () => false,
 ): Promise<PreparedImageBatch> {
   const images: PreparedImage[] = [];
   let cached = 0;
   let downloaded = 0;
   let skippedForQuota = 0;
+  /** 本次要新计额度的张数（已经计过的不算）。 */
+  let chargedNew = 0;
   for (const url of urls.slice(0, max)) {
     const key = normalizeUrl(url);
     const hit = cacheGet(key);
@@ -186,7 +193,8 @@ export async function prepareImageUrls(
       cached += 1;
       continue;
     }
-    if (downloaded >= maxNew) {
+    const charged = alreadyCharged(key);
+    if (!charged && chargedNew >= maxNew) {
       skippedForQuota += 1;
       continue;
     }
@@ -202,6 +210,7 @@ export async function prepareImageUrls(
       };
       cacheSet(key, image);
       images.push({ ...image, url });
+      if (!charged) chargedNew += 1;
       downloaded += 1;
       log.debug("media", `图片已处理：${meta.width}x${meta.height}, ${prepared.data.byteLength} 字节（${prepared.mime}）`);
     } catch (err) {

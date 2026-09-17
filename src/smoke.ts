@@ -6,29 +6,27 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import sharp from "sharp";
-import type { Config } from "./config.js";
-import { splitContextAttachments } from "./context.js";
-import { buildFollowUpCard, buildRootCard, topicKey } from "./forward.js";
-import { History } from "./history.js";
-import { loadKnowledgeBase } from "./kb.js";
-import { Limits } from "./limits.js";
-import { buildMessages } from "./llm.js";
-import { clearPreparedImageCache, prepareImages, prepareImageUrls, quotedImageUrls, resizeImageBuffer } from "./media.js";
+import type { Config } from "./core/config.js";
+import { stripMentions, truncateText } from "./core/text.js";
+import { loadKnowledgeBase } from "./kb/kb.js";
+import { buildMessages } from "./llm/messages.js";
+import { EXPOSED_TOOLS, FORWARD_FEEDBACK_TOOL, ForwardFeedbackArgs, SEND_FOLLOWUP_TOOL, SendFollowupArgs, createTurnTools } from "./llm/tools.js";
+import { extractTextToolCalls, runTextToolCalls } from "./llm/toolmarkup.js";
+import { buildFollowUpCard, buildRootCard } from "./lark/cards.js";
+import { topicKey } from "./lark/forwarder.js";
+import { splitContextAttachments } from "./qq/context.js";
+import { clearPreparedImageCache, prepareImages, prepareImageUrls, quotedImageUrls, resizeImageBuffer } from "./qq/media.js";
 import {
-  EXPOSED_TOOLS,
   buildUserText,
-  createArrivalTracker,
-  createSerialQueue,
   ensureQuotaNotice,
-  needsQuote,
   platformBackground,
   sendMainReply,
   splitReply,
-} from "./qq.js";
-import { FILE_PATTERNS, dayKey, migrateLegacyForwards, monthKey, pruneByAge, stampKey } from "./retention.js";
-import { stripMentions, truncateText } from "./text.js";
-import { extractTextToolCalls, runTextToolCalls } from "./toolmarkup.js";
-import { FORWARD_FEEDBACK_TOOL, ForwardFeedbackArgs, SEND_FOLLOWUP_TOOL, SendFollowupArgs, createTurnTools } from "./tools.js";
+} from "./qq/reply.js";
+import { createArrivalTracker, createSerialQueue, needsQuote } from "./qq/queue.js";
+import { History } from "./store/history.js";
+import { Limits } from "./store/limits.js";
+import { FILE_PATTERNS, dayKey, migrateLegacyForwards, monthKey, pruneByAge, stampKey } from "./store/retention.js";
 
 const cfg = {
   IMG_MAX_EDGE: 1280,
@@ -185,7 +183,7 @@ const forwardedOnce = await turn3.exec("forward_feedback", JSON.stringify({ summ
 check("转交：仍走原来的路径", forwardedOnce.forwarded && turn3.followups.length === 0);
 check("未知工具仍然被挡", (await turn3.exec("delete_everything", "{}")).text.includes("未知工具"));
 
-// 两个工具都注入：send_followup 是「确实想发两条」的出口（见 src/qq.ts 的 EXPOSED_TOOLS）。
+// 两个工具都注入：send_followup 是「确实想发两条」的出口（见 src/llm/tools.ts 的 EXPOSED_TOOLS）。
 check(
   "工具注入：forward_feedback 与 send_followup 都给模型",
   EXPOSED_TOOLS.map((t) => t.function.name).join(",") === "forward_feedback,send_followup",
@@ -345,6 +343,34 @@ check("额度兜底：模型已说明时不重复", ensureQuotaNotice("今天图
 check("额度兜底：模型说「明天再发图」也算已告知", ensureQuotaNotice("先用文字描述，明天再发图也行~", true) === "先用文字描述，明天再发图也行~");
 check("额度兜底：没超额时不动回复", ensureQuotaNotice("课表不显示可以先连校园网。", false) === "课表不显示可以先连校园网。");
 check("额度兜底：回复为空时直接给告知句", ensureQuotaNotice("", true).startsWith("今天图片额度用完了"));
+// 额度是全天累计的：本条消息的图读到了、是更早的图占了额度时，不能补一句「图我没读到」。
+check(
+  "额度兜底：本条消息的图读到了就不谎称「图我没读到」",
+  ensureQuotaNotice("已经转给负责的同学了。", true, false).includes("新发的图我读不到") &&
+    !ensureQuotaNotice("已经转给负责的同学了。", true, false).includes("图我没读到"),
+);
+check(
+  "额度告知：本条消息的图确实没被读到时才这么说",
+  buildUserText({
+    question: "看看这个",
+    senderName: "小明",
+    skippedImages: 0,
+    imageQuotaExhausted: true,
+    quotaSkippedCurrentImages: true,
+  }).includes("这条消息里的图片没有被读取"),
+);
+check(
+  "额度告知：额度被更早的图用掉时，不谎称本条消息的图没读到",
+  ((): boolean => {
+    const text = buildUserText({
+      question: "看看这个",
+      senderName: "小明",
+      skippedImages: 0,
+      imageQuotaExhausted: true,
+    });
+    return text.includes("读图额度已经用完") && !text.includes("这条消息里的图片没有被读取");
+  })(),
+);
 
 // 6. 飞书卡片结构与话题聚合
 const sample = {
@@ -378,6 +404,11 @@ check("补充卡片：同样是概要外露 + 一个折叠面板", followUpEleme
 check("补充卡片：蓝色标题以区分", JSON.stringify(followUp).includes('"blue"'));
 
 check("提示词：已无「主人」称呼", !kb.systemPrompt.includes("主人"));
+// 条目 id 不给模型：话题聚合没启用（工具参数里没有 topic，模型填不了），发出去只占 token。
+check(
+  "知识库：提示词里不带用不上的条目 id",
+  !kb.systemPrompt.includes("（id: ") && kb.systemPrompt.includes("## "),
+);
 check(
   "提示词：要求概要带用户名",
   kb.systemPrompt.includes("用户<昵称>") && kb.systemPrompt.includes("用户Heuluck要求修改姓名"),
@@ -412,6 +443,23 @@ check(
   limitedContext.truncated && limitedContext.text.includes("本条过长，已截断"),
 );
 check("上下文：整段按上限裁剪且保留最新", limitedContext.text.length <= 560 && limitedContext.text.includes("最新的问题在这里"));
+// 整段裁剪不能从半条消息中间切：平台这段是按消息渲染的，模型该从一条完整消息开始看。
+const boundaryContext = [
+  "=== 消息 1 ===",
+  `[消息内容] ${"丁".repeat(400)}`,
+  "=== 消息 2 ===",
+  "[消息内容] 中间这条",
+  "=== 消息 3 ===",
+  "[消息内容] 最新的问题在这里",
+].join("\n");
+const boundaryKept = splitContextAttachments(boundaryContext, { maxChars: 120, maxPerMessage: 0 });
+check(
+  "上下文：整段裁剪落在消息边界上（不会从半条消息开始）",
+  boundaryKept.truncated &&
+    boundaryKept.text.startsWith("（较早的上下文已省略）\n=== 消息") &&
+    boundaryKept.text.includes("最新的问题在这里"),
+  JSON.stringify(boundaryKept.text.slice(0, 40)),
+);
 
 const limitsCfg = {
   ...cfg,
@@ -513,16 +561,32 @@ check("配额：跨日启动归档旧用量", existsSync(join(archiveDir, "limit
 check("配额：跨日启动后计数归零", staleLimits.check("老用户").ok);
 await staleLimits.flush();
 
-// 每日读图额度
+// 每日读图额度（按图片本身计，同一张图今天只扣一次）
 const imgLimiter = new Limits({ ...limitsCfg, DATA_DIR: "data/smoke-tmp/img" } as unknown as Config);
 await imgLimiter.init();
 check("读图额度：初始为每日上限", imgLimiter.imageBudget("U1") === limitsCfg.IMG_DAILY_LIMIT_PER_USER);
-imgLimiter.consumeImages("U1", 3);
+for (const url of ["https://x/1.png", "https://x/2.png", "https://x/3.png"]) imgLimiter.consumeImage("U1", url);
 check("读图额度：扣减后剩余正确", imgLimiter.imageBudget("U1") === limitsCfg.IMG_DAILY_LIMIT_PER_USER - 3);
+check(
+  "读图额度：同一张图重复遇到不再扣（缓存被淘汰后重新下载也不会）",
+  imgLimiter.consumeImage("U1", "https://x/1.png") === false &&
+    imgLimiter.imageBudget("U1") === limitsCfg.IMG_DAILY_LIMIT_PER_USER - 3 &&
+    imgLimiter.imageCharged("U1", "https://x/1.png"),
+);
+check("读图额度：没读过的图仍然会扣", imgLimiter.consumeImage("U1", "https://x/9.png") === true);
 check("读图额度：不同用户互不影响", imgLimiter.imageBudget("U2") === limitsCfg.IMG_DAILY_LIMIT_PER_USER);
-imgLimiter.consumeImages("U1", 999);
+for (let i = 0; i < 999; i += 1) imgLimiter.consumeImage("U1", `https://x/bulk-${i}.png`);
 check("读图额度：不会变成负数", imgLimiter.imageBudget("U1") === 0);
 await imgLimiter.flush();
+
+// 额度按图去重的状态要能跨重启恢复，否则重启后同一张图会被再扣一次。
+const imgReloaded = new Limits({ ...limitsCfg, DATA_DIR: "data/smoke-tmp/img" } as unknown as Config);
+await imgReloaded.init();
+check(
+  "读图额度：重启后仍记得哪些图已计过额度",
+  imgReloaded.imageCharged("U1", "https://x/1.png") && imgReloaded.imageBudget("U1") === 0,
+);
+await imgReloaded.flush();
 
 // 9. 本地对话缓冲（渲染成多轮 messages）
 const historyCfg = {
@@ -649,6 +713,20 @@ check(
 check(
   "缓冲：没有工具调用的轮次读回来是空数组（不会误报调用过）",
   reloaded2.render("G11", { speakerId: "U1" }).turns.find((t) => t.role === "user")?.toolRounds.length === 0,
+);
+
+// 折叠空白但不能把换行也折掉：用户粘贴的日志/堆栈靠换行保持结构
+history.record("G13", {
+  at: Date.now() - 30_000,
+  role: "user",
+  senderId: "U1",
+  senderName: "甲",
+  content: "报错如下：\n\n  at foo.ts:1\n  at bar.ts:2",
+});
+check(
+  "缓冲：历史保留换行（堆栈不会折成一坨），空行合并成一个",
+  textOf("G13").includes("报错如下：\n at foo.ts:1\n at bar.ts:2"),
+  JSON.stringify(textOf("G13")),
 );
 
 const disabled = new History({ ...historyCfg, HISTORY_ENABLED: false } as unknown as Config);
@@ -779,6 +857,58 @@ check(
     "S",
   ).map((m) => m.role).join(",") === "system,assistant,user",
 );
+// 模型「正文 + 工具调用」是同一条 assistant 消息：正文已经随 tool_calls 回放过，
+// 再加一条同样的文本，历史里就有两份答案（提示词又要求它别重复自己说过的话）。
+check(
+  "多轮组装：正文与工具调用同一条消息时，历史里只有一份答复",
+  (() => {
+    const built2 = buildMessages(
+      {
+        history: [
+          { role: "user", parts: [{ text: "[16:04] 用户A: 崩了" }] },
+          {
+            role: "assistant" as const,
+            parts: [{ text: "先换成 5.16.0，已经转给负责的同学了。" }],
+            toolRounds: [
+              {
+                content: "先换成 5.16.0，已经转给负责的同学了。",
+                calls: [{ id: "call_y1", name: "forward_feedback", argsJson: "{}", result: "已转交人工处理。" }],
+              },
+            ],
+          },
+        ],
+        userParts: [{ text: "问题：还没好" }],
+        tools: [fakeTool],
+        execTool: async () => ({ text: "", forwarded: false }),
+      },
+      "S",
+    );
+    const texts = built2.map((m) => (typeof m.content === "string" ? m.content : ""));
+    return (
+      built2.map((m) => m.role).join(",") === "system,user,assistant,tool,user" &&
+      texts.filter((text) => text.includes("已经转给负责的同学了")).length === 1
+    );
+  })(),
+);
+// 正文与工具调用**不同**（例如代码补了一句额度告知）时要照常补上那条文本，不能丢。
+check(
+  "多轮组装：正文与工具调用内容不同时，仍单独回放正文",
+  buildMessages(
+    {
+      history: [
+        {
+          role: "assistant" as const,
+          parts: [{ text: "答案。今天图片额度用完了，图我没读到。" }],
+          toolRounds: [{ content: "答案。", calls: [{ id: "call_y2", name: "forward_feedback", argsJson: "{}", result: "已转交。" }] }],
+        },
+      ],
+      userParts: [{ text: "问题：x" }],
+      tools: [fakeTool],
+      execTool: async () => ({ text: "", forwarded: false }),
+    },
+    "S",
+  ).map((m) => m.role).join(",") === "system,assistant,tool,assistant,user",
+);
 
 // 11. 同群串行队列：并发消息不能读到「有问题、还没答复」的中间态
 const enqueue = createSerialQueue();
@@ -843,6 +973,22 @@ const runResult = await runTextToolCalls(leaked, async (name, argsJson) => {
 check("工具标记：调用被真的执行", executed.length === 1 && runResult.forwarded, executed.join(","));
 check("工具标记：无标记时不误判", extractTextToolCalls("课表不显示可以先连校园网。").calls.length === 0);
 check("工具标记：内部标记【必须告知】也会被清掉", !extractTextToolCalls("【必须告知】今天图片额度用完了。").cleaned.includes("【必须告知】"));
+// 单引号属性：模型换了写法也不能变成「标记被删掉、调用没执行」。
+const singleQuoted = `<||DSML||calls><||DSML||invoke name='forward_feedback'><||DSML||parameter name='summary'>用户甲要求转人工</||DSML||parameter></||DSML||invoke></||DSML||calls>`;
+check(
+  "工具标记：属性用单引号也能解析",
+  extractTextToolCalls(singleQuoted).calls[0]?.name === "forward_feedback",
+  JSON.stringify(extractTextToolCalls(singleQuoted).calls),
+);
+// 标记会被无条件剔出正文，所以「解析不出来」必须能被调用方发现并记日志。
+const brokenMarkup = `<||DSML||calls><||DSML||invoke><||DSML||parameter>乱七八糟</||DSML||parameter></||DSML||invoke></||DSML||calls>`;
+check(
+  "工具标记：有标记却没解析出调用时会上报（不再静默吞掉）",
+  extractTextToolCalls(brokenMarkup).unparsedMarkup &&
+    extractTextToolCalls(brokenMarkup).calls.length === 0 &&
+    !extractTextToolCalls(brokenMarkup).cleaned.includes("DSML"),
+);
+check("工具标记：没有标记时不会误报解析失败", !extractTextToolCalls("课表不显示可以先连校园网。").unparsedMarkup);
 
 await history.flush();
 rmSync("data/smoke-tmp", { recursive: true, force: true });

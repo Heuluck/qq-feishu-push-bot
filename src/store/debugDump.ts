@@ -1,6 +1,6 @@
 import { appendFile, mkdir, rename, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { log } from "./log.js";
+import { log } from "../core/log.js";
 import { stampKey } from "./retention.js";
 
 /**

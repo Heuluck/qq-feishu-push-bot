@@ -1,3 +1,9 @@
+/**
+ * QQ 侧的装配：中间件顺序、限流入口，以及「读历史 → 准备图片 → 调模型 → 发回复 → 写历史」这条主链路。
+ *
+ * 与 SDK 无关的纯逻辑分在 `./queue.ts`（排队与到达簿记）、`./reply.ts`（回复组装与发送）、
+ * `./context.ts`（平台上下文解析）、`./media.ts`（图片处理）。
+ */
 import {
   MsgType,
   QQBot,
@@ -8,229 +14,29 @@ import {
   quoteRef,
 } from "@tencent-connect/qqbot-nodejs";
 import type { ResolvedQuote } from "@tencent-connect/qqbot-nodejs";
-import type { Config } from "./config.js";
+import type { Config } from "../core/config.js";
+import { log, qqLogger } from "../core/log.js";
+import { stripMentions, truncateText } from "../core/text.js";
+import type { LlmClient } from "../llm/client.js";
+import type { LlmTurn, MessagePart } from "../llm/messages.js";
+import { EXPOSED_TOOLS, createTurnTools } from "../llm/tools.js";
+import type { FeedbackForwarder } from "../lark/forwarder.js";
+import { dumpRawEvent } from "../store/debugDump.js";
+import type { History } from "../store/history.js";
+import type { Limits } from "../store/limits.js";
 import { splitContextAttachments } from "./context.js";
-import { dumpRawEvent } from "./debugDump.js";
-import type { FeedbackForwarder } from "./forward.js";
-import type { History } from "./history.js";
-import type { Limits } from "./limits.js";
-import type { LlmClient, LlmTurn, MessagePart } from "./llm.js";
-import { log, qqLogger } from "./log.js";
 import { normalizeUrl, prepareImageUrls, prepareImages, quotedImageUrls } from "./media.js";
 import type { InboundAttachment, PreparedImage } from "./media.js";
-import { stripMentions, truncateText } from "./text.js";
-import { FORWARD_FEEDBACK_TOOL, SEND_FOLLOWUP_TOOL, createTurnTools } from "./tools.js";
-
-/** 单条回复的分段长度。 */
-const MAX_REPLY_CHARS = 1600;
-
-/**
- * 同一个 `msg_id` 最多能发几条被动回复。
- *
- * 官方文档（tencent-connect/bot-docs，send.md）按场景写明：群聊「被动消息（回复类）有效时间为 5 分钟，
- * **每个消息最多回复 5 次**，超时或超频会发送（回复）失败」。注意是 5 分钟不是 60 分钟——
- * 60 分钟那条是**单聊**的。同一 `msg_id` 下每条回复要用不同的 `msg_seq`（SDK 会自动填）。
- *
- * 因此主回复的分段数 + 补充消息要一起卡在这条线以内，否则最后几条会发不出去。
- */
-const MAX_PASSIVE_REPLIES = 5;
-
-/**
- * 按 key 串行执行，后到的任务等前一个跑完。
- *
- * 上下文是同群共享的可变状态，而「读历史 → 调模型 → 写回复」这一整段不能被别的消息插进来：
- * 插进来就会读到「有问题、还没答复」的中间态，历史错乱后模型会把自己的上一轮回答当成新问题，
- * 出现「自问自答」（中文社区有同构的踩坑记录）。CowAgent 的默认也是这个语义
- * （`concurrency_in_session: 1`，注释直写 >1 可能导致回复乱序）。
- */
-export function createSerialQueue(): <T>(key: string, task: () => Promise<T>) => Promise<T> {
-  const tails = new Map<string, Promise<unknown>>();
-  return <T>(key: string, task: () => Promise<T>): Promise<T> => {
-    const previous = tails.get(key) ?? Promise.resolve();
-    // 前一个任务失败也要继续排队，所以 onFulfilled / onRejected 都指向 task。
-    const next = previous.then(task, task);
-    const settled = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    tails.set(key, settled);
-    void settled.then(() => {
-      if (tails.get(key) === settled) tails.delete(key);
-    });
-    return next;
-  };
-}
-
-/**
- * QQ 单条文本长度有限，长回复按段落拆成多条发送（SDK 会自动递增 msg_seq）。
- * 段数也设上限：平台对同一 msg_id 的被动回复条数存在限制（具体数值官方未公开），
- * 超出的部分并入最后一条并标注截断。
- */
-export function splitReply(text: string, max = MAX_REPLY_CHARS, maxChunks = 3): string[] {
-  const trimmed = text.trim();
-  if (trimmed === "") return [];
-
-  const chunks: string[] = [];
-  let rest = trimmed;
-  while (rest.length > max && chunks.length < maxChunks) {
-    const head = rest.slice(0, max);
-    const cut = Math.max(head.lastIndexOf("\n"), head.lastIndexOf("。"), head.lastIndexOf("；"));
-    const at = cut > max * 0.5 ? cut + 1 : max;
-    chunks.push(rest.slice(0, at).trim());
-    rest = rest.slice(at).trim();
-  }
-
-  if (rest !== "") {
-    if (chunks.length >= maxChunks) {
-      // 段数已到上限：把剩余内容的提示并入最后一段，并让它整体仍不超过单段上限。
-      const note = "…（内容过长，已截断）";
-      const lastIndex = chunks.length - 1;
-      const last = chunks[lastIndex]!;
-      chunks[lastIndex] = `${last.slice(0, Math.max(1, max - note.length)).trimEnd()}${note}`;
-    } else {
-      chunks.push(rest);
-    }
-  }
-  return chunks.filter((chunk) => chunk !== "");
-}
-
-/**
- * 每个群里「最近一条进来的消息」的序号。
- *
- * 只服务于一个判断：**从收到这条 @ 消息、到答案生成完毕准备发送，这中间群里有没有人插话**。
- * 平台把同一 `msg_id` 的多条回复排在触发消息下面，一旦有人插话，机器人的回复就飘在新消息上面、
- * 群里看不出它在回谁——这时要显式引用那条 @ 消息（见 `sendMainReply`）。
- */
-export interface ArrivalTracker {
-  /** 记一条刚收到的群消息，返回该群的新序号——调用方把它当作「我这条」的序号留着。 */
-  mark(groupId: string): number;
-  /** 这个序号之后，该群是否又进过消息。 */
-  hasNewArrival(groupId: string, seq: number): boolean;
-}
-
-/** 久未活跃的群，簿记留 30 分钟即可：比任何一次「生成 + 发送」的时长都宽裕得多。 */
-const ARRIVAL_TTL_MS = 30 * 60_000;
-
-export function createArrivalTracker(): ArrivalTracker {
-  // 序号全局递增，每个群只记「自己最后一条」：别的群进消息不会让这个群误判。
-  let nextSeq = 1;
-  const last = new Map<string, { seq: number; at: number }>();
-  return {
-    mark(groupId: string): number {
-      const seq = nextSeq++;
-      last.set(groupId, { seq, at: Date.now() });
-      // 机器人进的群会一直变多，簿记只该跟「最近活跃的群数」有关：攒到一定量就清掉久未发言的。
-      if (last.size > 200) {
-        const deadline = Date.now() - ARRIVAL_TTL_MS;
-        for (const [key, entry] of last) {
-          if (entry.at < deadline) last.delete(key);
-        }
-      }
-      return seq;
-    },
-    hasNewArrival(groupId: string, seq: number): boolean {
-      const entry = last.get(groupId);
-      return entry !== undefined && entry.seq > seq;
-    },
-  };
-}
-
-/** 该群在「我这条」之后又进过消息 → 回复要引用回那条 @ 消息。 */
-export function needsQuote(arrivals: ArrivalTracker, groupId: string, ownSeq: unknown): boolean {
-  return typeof ownSeq === "number" && arrivals.hasNewArrival(groupId, ownSeq);
-}
-
-/** 发一条回复的两条通道：不带引用 / 带引用。 */
-export interface ReplyChannel {
-  /** 普通被动回复（`bot.sendText`）。 */
-  plain: (content: string) => Promise<unknown>;
-  /** 带 `message_reference` 的被动回复（`bot.send`）——`sendText` 没有这个参数。 */
-  quoted: (content: string) => Promise<unknown>;
-}
-
-/**
- * 发主回复的各段，`quote` 为真时每段都引用回那条 @ 消息。
- *
- * 引用发不出去时退回普通回复：引用只是为了「让这条挂在原问题下面」，宁可少个引用，
- * 也不能把答案吞掉（外层 errorHandler 只会回一句「出了点小问题」）。代价是万一「已送达但响应丢失」，
- * 用户会看到两条一样的——比收不到答案轻得多。补充消息（`send_followup`）不走这里，不需要引用。
- */
-export async function sendMainReply(channel: ReplyChannel, chunks: string[], quote: boolean): Promise<void> {
-  for (const chunk of chunks) {
-    if (!quote) {
-      await channel.plain(chunk);
-      continue;
-    }
-    try {
-      await channel.quoted(chunk);
-    } catch (err) {
-      log.warn("qq", `带引用的回复没发出去，退回普通回复：${err instanceof Error ? err.message : String(err)}`);
-      await channel.plain(chunk);
-    }
-  }
-}
-
-/**
- * 暴露给模型的工具定义。个数与内容必须稳定，否则会破坏请求前缀缓存。
- *
- * `SEND_FOLLOWUP_TOOL` 是「模型想多发一条消息」的出口：正文之外再排一条，由 `qq.ts` 在正文之后发出。
- * 一次调用完成的流程下它不是必需的（实测只有 1/10 会用到），留着是因为「想分开说两件事」是真实需求，
- * 而平台允许同一 `msg_id` 最多发 5 条。
- */
-export const EXPOSED_TOOLS = [FORWARD_FEEDBACK_TOOL, SEND_FOLLOWUP_TOOL];
-
-export const PLATFORM_CONTEXT_LABEL =
-  "[对话上下文] 平台给的背景：这条消息之前群里的最近几条消息，可能含其他成员的消息与附件。它是背景，不是这次要处理的新问题";
-
-/**
- * 平台给的上下文渲染成一个内容片段。
- *
- * 这段文本是平台预渲染好的，没有发言人归属、也没有每条的发言时间，拼不出「轮次」，
- * 所以只能整段跟在问题后面当背景，不能塞进历史里当一轮。
- * 它的图片紧跟在说明文字之后——位置在说明之后，模型才能知道这些是背景里的图，不是这次发的。
- */
-export function platformBackground(text: string): string {
-  return `${PLATFORM_CONTEXT_LABEL}：\n${text}`;
-}
-
-export function buildUserText(args: {
-  question: string;
-  senderName?: string;
-  skippedImages: number;
-  /** 今天的读图额度已用完：要照常回答文字问题，但明确告诉用户图看不了了。 */
-  imageQuotaExhausted?: boolean;
-}): string {
-  const lines: string[] = [];
-  if (args.senderName) lines.push(`（发送者：${args.senderName}）`);
-  // 【必须告知】放在问题前面：这个位置模型更容易照做（实测放在末尾时转交场景会漏）。
-  // 约定标记的硬规则写在系统提示词里：出现这个标记，就必须把这句写进给用户的回复。
-  if (args.skippedImages > 0) {
-    lines.push(`【必须告知】另有 ${args.skippedImages} 张图片没能读取，请让用户重发或改用文字描述。`);
-  }
-  if (args.imageQuotaExhausted) {
-    lines.push(
-      "【必须告知】该用户今天的读图额度已经用完，这条消息里的图片没有被读取。" +
-        "回复里必须带上这句意思（可直接用这句话）：「今天图片额度用完了，图我没读到」——" +
-        "然后请他先用文字描述，或明天再发图。转交时也要写这句。",
-    );
-  }
-  lines.push(args.question !== "" ? `问题：${args.question}` : "问题：（无文字，见上面的历史或下面的图片）");
-  return lines.join("\n");
-}
-
-/** 读图额度用完时的固定告知句（模型漏说时由代码补上）。 */
-const QUOTA_NOTICE = "今天图片额度用完了，图我没读到，麻烦先用文字描述一下，或者明天再发图喵~";
-const QUOTA_MENTIONED = /额度|没读|读不了|读不到|明天再发图|明天再补/;
-
-/**
- * 保证「读图额度用完」这件事一定被说出口。
- * 提示词里已经立了硬规则、还给了可照抄的句子，但实测在「转交」场景仍有约 1/3 会漏
- * （模型在工具调用之后只顾着写收尾话术），所以这里补一道确定性兜底：漏了就追加一句。
- */
-export function ensureQuotaNotice(reply: string, quotaExhausted: boolean): string {
-  if (!quotaExhausted || QUOTA_MENTIONED.test(reply)) return reply;
-  return reply === "" ? QUOTA_NOTICE : `${reply}\n${QUOTA_NOTICE}`;
-}
+import {
+  MAX_PASSIVE_REPLIES,
+  MAX_REPLY_CHARS,
+  buildUserText,
+  ensureQuotaNotice,
+  platformBackground,
+  sendMainReply,
+  splitReply,
+} from "./reply.js";
+import { createArrivalTracker, createSerialQueue, needsQuote } from "./queue.js";
 
 export interface QqDeps {
   cfg: Config;
@@ -288,6 +94,9 @@ export function createQqBot(deps: QqDeps): QQBot {
           rawEventType: m.rawEventType,
         });
         if (m.kind !== "group") return;
+        // 与 message 处理里的目标群过滤保持一致：别的群的闲聊不该进对话缓冲，
+        // 否则机器人所在的群越多，data/history.json 被无关消息撑得越大。
+        if (cfg.QQ_GROUP_OPENID && m.groupOpenid !== cfg.QQ_GROUP_OPENID) return;
         const text = (m.content ?? "").trim();
         const imageUrls = (m.attachments ?? [])
           .filter((att) => att.content_type?.startsWith("image/") && typeof att.url === "string")
@@ -308,7 +117,10 @@ export function createQqBot(deps: QqDeps): QQBot {
     }),
   );
   // 频次与配额在 Limits 里统一处理（豁免用户需要跳过部分限制，SDK 的 rateLimiter 做不到条件豁免）。
-  bot.use(quoteRef({ maxSize: 500 }));
+  // 这里的 contentLimit 是**单条被引消息存多少字**（SDK 默认只有 200）：平台没下发 msg_elements 时
+  // 引用只能从这个索引里取，默认 200 字会让「引用一条长消息」时模型只看到开头。
+  // 注意别把 maxSize 当成字符上限——那是索引的 LRU 条数（默认 500，够用）。
+  bot.use(quoteRef({ contentLimit: cfg.CONTEXT_MESSAGE_MAX_CHARS }));
 
   bot.on("ready", () => log.info("qq", "WebSocket 网关已连接"));
   bot.on("resumed", () => log.info("qq", "WebSocket 会话已恢复"));
@@ -395,36 +207,46 @@ export function createQqBot(deps: QqDeps): QQBot {
 
       const started = Date.now();
       // 图片额度分两层：各来源的张数上限，以及单用户每日**新读**上限。
-      // 额度按「真正下载了几张」算：同一张图第二次遇到就走缓存，不重复扣，
-      // 否则用户发一张截图聊三句，今天的额度就用完了。
-      const dailyBudget = limits.imageBudget(msg.senderId);
-      let downloaded = 0;
+      // 额度按**图片本身**计（同一张图今天只扣一次，见 Limits.consumeImage）：只按「这一轮下载了
+      // 几张」计的话，缓存被淘汰后重新下载同一张图会反复扣，用户聊三句当天额度就没了。
       let skippedForQuota = 0;
-      const newSlots = (): number => Math.max(0, dailyBudget - downloaded);
+      let downloadedTotal = 0;
+      let chargedNew = 0;
+      const newSlots = (): number => limits.imageBudget(msg.senderId);
+      /** 这张图今天是否已经计过额度（额度不足时，已读过的旧图仍要能出现在历史里）。 */
+      const alreadyCharged = (key: string): boolean => limits.imageCharged(msg.senderId, key);
+      /** 真正读到（含缓存命中）才计额度；同一张图重复遇到不会重复扣。 */
+      const chargeImages = (images: PreparedImage[]): void => {
+        for (const image of images) {
+          if (limits.consumeImage(msg.senderId, normalizeUrl(image.url))) chargedNew += 1;
+        }
+      };
       const account = (batch: { downloaded: number; skippedForQuota: number }): void => {
-        downloaded += batch.downloaded;
+        downloadedTotal += batch.downloaded;
         skippedForQuota += batch.skippedForQuota;
       };
       // 同一个 URL 只喂一次：同一张图可能同时出现在当前消息、引用、历史、平台文本里。
+      // takeNew 只**看一眼**是否已喂过，真正标记发生在取到图之后（markUsed）——
+      // 下载失败的图要留给后面的来源再试一次。
       const usedUrls = new Set<string>();
-      const takeNew = (urls: string[]): string[] =>
-        urls.filter((url) => {
-          const key = normalizeUrl(url);
-          if (usedUrls.has(key)) return false;
-          usedUrls.add(key);
-          return true;
-        });
+      const takeNew = (urls: string[]): string[] => urls.filter((url) => !usedUrls.has(normalizeUrl(url)));
+      const markUsed = (images: PreparedImage[]): void => {
+        for (const image of images) usedUrls.add(normalizeUrl(image.url));
+      };
       const toParts = (images: PreparedImage[]): MessagePart[] => images.map((image) => ({ image: image.dataUrl }));
 
       // 1) 当前消息自带的附件
-      const prepared = await prepareImages(attachments, cfg, cfg.IMG_MAX_COUNT, newSlots());
+      const prepared = await prepareImages(attachments, cfg, cfg.IMG_MAX_COUNT, newSlots(), alreadyCharged);
       account(prepared);
-      // 只把**真的取到**的标成已用：下载失败的那张留给后面的来源再试一次。
-      takeNew(prepared.images.map((image) => image.url));
+      chargeImages(prepared.images);
+      markUsed(prepared.images);
 
       // 2) 被引用消息里的图片（平台不会把它渲染进上下文文本，必须单独读）
-      const fromQuote = await prepareImageUrls(takeNew(quotedImages), cfg, cfg.IMG_MAX_COUNT, newSlots());
+      const quoteCandidates = takeNew(quotedImages);
+      const fromQuote = await prepareImageUrls(quoteCandidates, cfg, cfg.IMG_MAX_COUNT, newSlots(), alreadyCharged);
       account(fromQuote);
+      chargeImages(fromQuote.images);
+      markUsed(fromQuote.images);
 
       // 3) 历史轮次：图挂在**它自己那一轮**上，不挪到当前轮——位置本身就是模型区分新旧的依据
       const historyTurns: LlmTurn[] = [];
@@ -436,8 +258,10 @@ export function createQqBot(deps: QqDeps): QQBot {
           historyTurns.push({ role, parts: [{ text: turn.text }], ...toolRounds });
           continue;
         }
-        const batch = await prepareImageUrls(takeNew(turn.images), cfg, turn.images.length, newSlots());
+        const batch = await prepareImageUrls(takeNew(turn.images), cfg, turn.images.length, newSlots(), alreadyCharged);
         account(batch);
+        chargeImages(batch.images);
+        markUsed(batch.images);
         historyImageCount += batch.images.length;
         historyTurns.push({ role, parts: [{ text: turn.text }, ...toParts(batch.images)], ...toolRounds });
       }
@@ -448,12 +272,24 @@ export function createQqBot(deps: QqDeps): QQBot {
         cfg,
         cfg.IMG_MAX_COUNT,
         newSlots(),
+        alreadyCharged,
       );
       account(fromContext);
+      chargeImages(fromContext.images);
+      markUsed(fromContext.images);
 
-      const skippedImages = prepared.skipped + Math.max(0, quotedImages.length - fromQuote.images.length);
+      // 「没能读取」只算真的试过却没拿到的，且**不含额度原因**：
+      //   - 被别的来源先喂过的同一张图不算（那是去重，用户看到的图还在）；
+      //   - 额度挡下的另有专门一句告知（「明天再发图」），混进来会变成让用户「重发一遍」——
+      //     可额度没恢复，重发也读不到。
+      const skippedImages =
+        prepared.skipped -
+        prepared.skippedForQuota +
+        Math.max(0, quoteCandidates.length - fromQuote.images.length - fromQuote.skippedForQuota);
+      // 额度是否用完了（可能是本条消息、也可能是更早的图占了额度）…
       const quotaExhausted = skippedForQuota > 0;
-      if (downloaded > 0) limits.consumeImages(msg.senderId, downloaded);
+      // …但只有本条消息（含它引用的消息）的图确实被额度挡下时，才能说「这条消息里的图片没被读取」。
+      const quotaSkippedCurrentImages = prepared.skippedForQuota + fromQuote.skippedForQuota > 0;
       if (quotaExhausted) {
         log.info("qq", `读图额度已用完（今日上限 ${cfg.IMG_DAILY_LIMIT_PER_USER} 张），本次放弃 ${skippedForQuota} 张`);
       }
@@ -465,6 +301,7 @@ export function createQqBot(deps: QqDeps): QQBot {
             senderName: msg.senderName,
             skippedImages,
             ...(quotaExhausted ? { imageQuotaExhausted: true } : {}),
+            ...(quotaSkippedCurrentImages ? { quotaSkippedCurrentImages: true } : {}),
           }),
         },
         ...toParts(prepared.images),
@@ -513,6 +350,7 @@ export function createQqBot(deps: QqDeps): QQBot {
             ? "已经转交给人工了，正在处理中喵~"
             : "呜……我暂时没找到答案，换个说法再问一次好不好喵~",
         quotaExhausted,
+        quotaSkippedCurrentImages,
       );
       // 有补充消息时先给它留一条：主回复的分段数 + 补充消息要一起落在平台那 5 条以内。
       const maxMainChunks = Math.max(1, Math.min(cfg.REPLY_MAX_CHUNKS, MAX_PASSIVE_REPLIES - tools.followups.length));
@@ -556,8 +394,9 @@ export function createQqBot(deps: QqDeps): QQBot {
           `（${result.toolRounds.flatMap((r) => r.calls.map((c) => c.name)).join(",") || "无"}）` +
           `｜引用那条@=${quoteTrigger ? "是" : "否"}` +
           `｜历史 ${historyTurns.length} 轮（历史图 ${historyImageCount} 张）｜本图 消息 ${prepared.images.length}/${attachments.length}` +
-          `、引用 ${fromQuote.images.length}/${quotedImages.length}｜新读 ${downloaded} 张` +
-          `（缓存 ${prepared.cached + fromQuote.cached + fromContext.cached}）｜平台背景=${platformContext.text !== ""}`,
+          `、引用 ${fromQuote.images.length}/${quoteCandidates.length}｜下载 ${downloadedTotal} 张` +
+          `、新计额度 ${chargedNew} 张（缓存 ${prepared.cached + fromQuote.cached + fromContext.cached}）` +
+          `｜平台背景=${platformContext.text !== ""}`,
       );
     });
   });

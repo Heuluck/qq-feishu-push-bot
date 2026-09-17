@@ -13,7 +13,7 @@
  *   3. 上下文里的单条消息、以及整段上下文都可能超长（有人粘贴大段日志时会很离谱）
  *      → 单条按上限截断，整段超出则以保留最新消息为优先从头部裁掉。
  */
-import { stripMentions, truncateText } from "./text.js";
+import { stripMentions, truncateText } from "../core/text.js";
 
 export interface ContextLimits {
   /** 整段上下文最多保留多少字符。 */
@@ -34,6 +34,8 @@ export interface ContextResult {
 const ATTACHMENT_LINE = /\[附件\d+\][^\n]*/g;
 const IMAGE_URL = /URL:(https?:\/\/\S+)/;
 const MESSAGE_HEADER = /^=== 消息 \d+ ===$/;
+/** 在整段文本里找消息开头（上面的那个逐行判断用，没有 /m）。 */
+const MESSAGE_HEADER_LINE = /^=== 消息 \d+ ===$/m;
 
 /** 按上限截断上下文里的单条消息，避免一条超长粘贴挤掉其他消息。 */
 function truncatePerMessage(text: string, maxPerMessage: number): { text: string; truncated: boolean } {
@@ -76,7 +78,11 @@ export function splitContextAttachments(rawText: string, limits?: ContextLimits)
 
   // 消息按时间从旧到新排列，超长时保留最新的部分。
   if (limits && limits.maxChars > 0 && text.length > limits.maxChars) {
-    text = `（较早的上下文已省略）\n${text.slice(-limits.maxChars)}`;
+    const tail = text.slice(-limits.maxChars);
+    // 直接切字符串会从半条消息（甚至某个附件行）中间开始。平台这段是按消息渲染的，
+    // 所以往前挪到下一条消息的开头，让模型从一条完整消息开始看。
+    const nextHeader = tail.search(MESSAGE_HEADER_LINE);
+    text = `（较早的上下文已省略）\n${nextHeader > 0 ? tail.slice(nextHeader) : tail}`;
     truncated = true;
   }
 

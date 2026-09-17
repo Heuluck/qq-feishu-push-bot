@@ -1,9 +1,9 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { Config } from "./config.js";
-import type { ToolRound } from "./llm.js";
-import { log } from "./log.js";
-import { truncateText } from "./text.js";
+import type { Config } from "../core/config.js";
+import type { ToolRound } from "../llm/messages.js";
+import { log } from "../core/log.js";
+import { truncateText } from "../core/text.js";
 
 /**
  * 本地对话缓冲：记录本群「用户 @ 消息」「机器人回复」，以及在平台投递全量消息时的普通消息。
@@ -222,9 +222,18 @@ function pickImages(entries: HistoryEntry[], speakerId: string | undefined, max:
  * （实测出现过「[16:12] 好嘞，搞定就行喵~」）。
  */
 function line(entry: HistoryEntry, maxChars: number): string {
-  const text = truncateText(entry.content.replace(/\s+/g, " ").trim(), maxChars);
+  const text = truncateText(collapse(entry.content), maxChars);
   if (entry.role === "bot") return text;
   return `[${hhmm(entry.at)}] 用户${entry.senderName ?? ""}: ${text}`;
+}
+
+/**
+ * 折叠空白，但**保留换行**：用户粘贴的报错日志/堆栈靠换行保持结构，历史里也折成一行的话，
+ * 模型看到的就只剩一坨（当前消息特意不折叠，见 qq/bot.ts 里 contentSanitizer 的说明）。
+ * 空行合并成一个，去掉没用的垂直空白。
+ */
+function collapse(text: string): string {
+  return text.replace(/[^\S\n]+/g, " ").replace(/\n{2,}/g, "\n").trim();
 }
 
 /** 东八区的 HH:mm。 */

@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { Config } from "./config.js";
-import { log } from "./log.js";
+import type { Config } from "../core/config.js";
+import { log } from "../core/log.js";
 import { dayKey } from "./retention.js";
 
 export type LimitReason = "user-rate" | "group-rate" | "user-daily" | "global-daily";
@@ -25,6 +25,13 @@ interface Persisted {
   globalCount: number;
   /** 单用户当天已读取的图片张数。 */
   imageCounts?: Record<string, number>;
+  /**
+   * 当天已经计过额度的图片 URL（同一张图只计一次）。
+   *
+   * 只有 URL 集合能表达「这张图今天读过了」：进程内图片缓存有上限（60 张 / 24MB），
+   * 历史里的图被淘汰后会重新下载，按下载次数计就会把用户当天的额度反复扣掉。
+   */
+  imageUrls?: Record<string, string[]>;
 }
 
 /**
@@ -38,6 +45,8 @@ export class Limits {
   private day = dayKey();
   private readonly userCounts = new Map<string, number>();
   private readonly imageCounts = new Map<string, number>();
+  /** 当天已经计过额度的图片 URL，按用户分组。 */
+  private readonly imageUrls = new Map<string, Set<string>>();
   private globalCount = 0;
   private readonly minuteWindows = new Map<string, number[]>();
   private readonly groupWindows = new Map<string, number[]>();
@@ -73,6 +82,7 @@ export class Limits {
         this.globalCount = raw.globalCount ?? 0;
         for (const [key, value] of Object.entries(raw.userCounts ?? {})) this.userCounts.set(key, value);
         for (const [key, value] of Object.entries(raw.imageCounts ?? {})) this.imageCounts.set(key, value);
+        for (const [key, value] of Object.entries(raw.imageUrls ?? {})) this.imageUrls.set(key, new Set(value));
         log.info(
           "limits",
           `今日配额已用：全局 ${this.globalCount}/${this.cfg.REPLY_LIMIT_GLOBAL_PER_DAY}`,
@@ -192,6 +202,7 @@ export class Limits {
     this.day = today;
     this.userCounts.clear();
     this.imageCounts.clear();
+    this.imageUrls.clear();
     this.globalCount = 0;
   }
 
@@ -201,12 +212,30 @@ export class Limits {
     return Math.max(0, this.cfg.IMG_DAILY_LIMIT_PER_USER - (this.imageCounts.get(senderId) ?? 0));
   }
 
-  /** 记下本次为该用户读了几张图。 */
-  consumeImages(senderId: string, count: number): void {
-    if (count <= 0 || senderId === "") return;
+  /** 这张图今天是否已经计过额度（计过的重复遇到不再扣）。 */
+  imageCharged(senderId: string, url: string): boolean {
+    return this.imageUrls.get(senderId)?.has(url) === true;
+  }
+
+  /**
+   * 为**一张具体的图**计一次额度；同一张图今天只计一次，返回是否真的扣了。
+   *
+   * 按图片本身计、而不是按「这一轮下载了几张」计：进程内缓存有上限，被淘汰的图会重新下载，
+   * 按下载次数计会让用户在聊几句之后额度被重复扣光（同一张截图本来只该算一张）。
+   */
+  consumeImage(senderId: string, url: string): boolean {
+    if (senderId === "" || url === "") return false;
     this.rollover();
-    this.imageCounts.set(senderId, (this.imageCounts.get(senderId) ?? 0) + count);
+    let charged = this.imageUrls.get(senderId);
+    if (charged === undefined) {
+      charged = new Set<string>();
+      this.imageUrls.set(senderId, charged);
+    }
+    if (charged.has(url)) return false;
+    charged.add(url);
+    this.imageCounts.set(senderId, (this.imageCounts.get(senderId) ?? 0) + 1);
     this.scheduleSave();
+    return true;
   }
 
   /** 把某一天的用量写成 limits.YYYY-MM-DD.json。 */
@@ -256,6 +285,7 @@ export class Limits {
       userCounts: Object.fromEntries(this.userCounts),
       globalCount: this.globalCount,
       imageCounts: Object.fromEntries(this.imageCounts),
+      imageUrls: Object.fromEntries([...this.imageUrls].map(([sender, urls]) => [sender, [...urls]])),
     };
     const tmp = `${this.file}.tmp`;
     await writeFile(tmp, JSON.stringify(payload, null, 2), "utf8");

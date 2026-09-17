@@ -1,7 +1,13 @@
+/**
+ * 暴露给模型的工具：定义、参数校验，以及本轮的调用执行器。
+ *
+ * 目前只有一个写操作工具（转交人工）+ 一个「再单独发一条消息」的出口。
+ * 工具集必须保持稳定，否则会破坏请求前缀缓存。
+ */
 import { z } from "zod";
 import type { ChatCompletionFunctionTool } from "openai/resources/chat/completions";
-import type { FeedbackForwarder } from "./forward.js";
-import type { ToolExecutionResult } from "./llm.js";
+import type { FeedbackForwarder } from "../lark/forwarder.js";
+import type { ToolExecutionResult } from "./messages.js";
 
 export const ForwardFeedbackArgs = z.object({
   summary: z
@@ -64,6 +70,15 @@ export const SEND_FOLLOWUP_TOOL: ChatCompletionFunctionTool = {
     parameters: z.toJSONSchema(SendFollowupArgs),
   },
 };
+
+/**
+ * 暴露给模型的工具定义。个数与内容必须稳定，否则会破坏请求前缀缓存。
+ *
+ * `SEND_FOLLOWUP_TOOL` 是「模型想多发一条消息」的出口：正文之外再排一条，由 `qq/bot.ts`
+ * 在正文之后发出。一次调用完成的流程下它不是必需的（实测只有 1/10 会用到），留着是因为
+ * 「想分开说两件事」是真实需求，而平台允许同一 `msg_id` 最多发 5 条（见 MAX_PASSIVE_REPLIES）。
+ */
+export const EXPOSED_TOOLS: ChatCompletionFunctionTool[] = [FORWARD_FEEDBACK_TOOL, SEND_FOLLOWUP_TOOL];
 
 export interface TurnTools {
   exec: (name: string, argsJson: string) => Promise<ToolExecutionResult>;

@@ -58,7 +58,7 @@ const EnvSchema = z.object({
    * 上下文（对话缓冲）里最多为该用户挑几张图。
    * 与 IMG_MAX_COUNT（单条消息自带的图）分开算：用户常常连发几张截图、中间还夹着别人的消息，
    * 因此按「该用户最近的图」去找，而不是按「最近 N 条消息」去找。
-   * 挑中的图挂在**它到来的那一轮**上——不设「已答复就不再喂」这类时效闸门，理由见 src/history.ts。
+   * 挑中的图挂在**它到来的那一轮**上——不设「已答复就不再喂」这类时效闸门，理由见 src/store/history.ts。
    */
   IMG_CONTEXT_MAX_COUNT: z.coerce.number().int().min(0).max(20).default(5),
   /** 同一个用户每天最多读几张图（超出后仍回答文字问题，但会告知用户读图额度用完）。 */
@@ -99,7 +99,7 @@ const EnvSchema = z.object({
   /**
    * 主回复最多分成几条发送。
    *
-   * 平台限制是「同一个 `msg_id` 最多 5 条被动回复」（见 src/qq.ts 的 MAX_PASSIVE_REPLIES），
+   * 平台限制是「同一个 `msg_id` 最多 5 条被动回复」（见 src/qq/reply.ts 的 MAX_PASSIVE_REPLIES），
    * 超出的部分会在发送时失败。有补充消息（send_followup）时，代码会先给它留出条数。
    */
   REPLY_MAX_CHUNKS: z.coerce.number().int().min(1).max(10).default(3),

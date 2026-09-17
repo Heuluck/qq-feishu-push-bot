@@ -1,14 +1,14 @@
-import { loadConfig } from "./config.js";
-import { initRawDump } from "./debugDump.js";
-import { loadDotEnv } from "./env.js";
-import { FeedbackForwarder } from "./forward.js";
-import { History } from "./history.js";
-import { loadKnowledgeBase } from "./kb.js";
-import { Limits } from "./limits.js";
-import { LlmClient } from "./llm.js";
-import { log, setLogLevel } from "./log.js";
-import { createQqBot } from "./qq.js";
-import { Maintenance, migrateLegacyForwards } from "./retention.js";
+import { loadConfig } from "./core/config.js";
+import { loadDotEnv } from "./core/env.js";
+import { log, setLogLevel } from "./core/log.js";
+import { loadKnowledgeBase } from "./kb/kb.js";
+import { LlmClient } from "./llm/client.js";
+import { FeedbackForwarder } from "./lark/forwarder.js";
+import { createQqBot } from "./qq/bot.js";
+import { initRawDump } from "./store/debugDump.js";
+import { History } from "./store/history.js";
+import { Limits } from "./store/limits.js";
+import { Maintenance, migrateLegacyForwards } from "./store/retention.js";
 
 async function main(): Promise<void> {
   loadDotEnv();

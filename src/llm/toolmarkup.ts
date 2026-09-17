@@ -14,8 +14,14 @@
 const DSML = "<\\|{2}DSML\\|{2}";
 const CALLS_BLOCK = new RegExp(`${DSML}calls>[\\s\\S]*?(?:<\\/\\|{2}DSML\\|{2}calls>|$)`, "g");
 const INVOKE_BLOCK = new RegExp(`${DSML}invoke[\\s\\S]*?(?=<\\/\\|{2}DSML\\|{2}invoke>|$)`, "g");
-const INVOKE_NAME = new RegExp(`${DSML}invoke\\s+name="([^"]+)"`);
-const PARAMETER = new RegExp(`${DSML}parameter\\s+name="([^"]+)"[^>]*>([\\s\\S]*?)<\\/\\|{2}DSML\\|{2}parameter>`, "g");
+/** 名字/参数的引号两种都认：模型写单引号并不罕见，漏掉就变成「标记被删、调用没执行」。 */
+const INVOKE_NAME = new RegExp(`${DSML}invoke\\s+name=["']([^"']+)["']`);
+const PARAMETER = new RegExp(
+  `${DSML}parameter\\s+name=["']([^"']+)["'][^>]*>([\\s\\S]*?)<\\/\\|{2}DSML\\|{2}parameter>`,
+  "g",
+);
+/** 只用来判断「正文里有没有调用标记」，与上面那些带 lastIndex 的 /g 正则分开。 */
+const DSML_MARK = /<\|\|DSML\|\|/;
 /** 我们自己的内部标记也可能被模型抄进回复。 */
 const INTERNAL_MARKER = /【必须告知】/g;
 
@@ -23,6 +29,19 @@ export interface TextToolCall {
   name: string;
   /** 参数以 JSON 字符串给出，便于直接喂给现有的工具执行器。 */
   argsJson: string;
+}
+
+export interface ParsedTextToolCalls {
+  /** 去掉调用标记后的正文（可以直接发给用户）。 */
+  cleaned: string;
+  calls: TextToolCall[];
+  /**
+   * 正文里有调用标记，却一个调用都没解析出来。
+   *
+   * 标记无论如何都会从正文里删掉（不能让内部信息漏到群里），所以这种情况必须让调用方
+   * 知道并记日志：否则表现就是「模型说已转交、标记也消失了、但那次调用根本没发生」。
+   */
+  unparsedMarkup: boolean;
 }
 
 /** 抠出 k="v" / k：v / k 为「v」这类参数（兼容半角全角标点）。 */
@@ -52,7 +71,7 @@ function jsonCall(text: string): TextToolCall | undefined {
 }
 
 /** 从正文里解析工具调用，并返回剔除标记后的正文。 */
-export function extractTextToolCalls(text: string): { cleaned: string; calls: TextToolCall[] } {
+export function extractTextToolCalls(text: string): ParsedTextToolCalls {
   const calls: TextToolCall[] = [];
 
   // 1) 原生标记形态（<||DSML||...>）
@@ -93,7 +112,7 @@ export function extractTextToolCalls(text: string): { cleaned: string; calls: Te
     cleaned = cleaned.replace(/(?:调用工具|调用|工具|invoke|tool)\s*[:：,，]?\s*"?[A-Za-z_][\w-]*"?[^\n]*/i, "");
   }
 
-  return { cleaned: cleaned.trim(), calls };
+  return { cleaned: cleaned.trim(), calls, unparsedMarkup: calls.length === 0 && DSML_MARK.test(text) };
 }
 
 /**
@@ -103,12 +122,12 @@ export function extractTextToolCalls(text: string): { cleaned: string; calls: Te
 export async function runTextToolCalls(
   text: string,
   execTool: (name: string, argsJson: string) => Promise<{ text: string; forwarded: boolean }>,
-): Promise<{ text: string; calls: TextToolCall[]; forwarded: boolean }> {
-  const { cleaned, calls } = extractTextToolCalls(text);
+): Promise<{ text: string; calls: TextToolCall[]; forwarded: boolean; unparsedMarkup: boolean }> {
+  const { cleaned, calls, unparsedMarkup } = extractTextToolCalls(text);
   let forwarded = false;
   for (const call of calls) {
     const result = await execTool(call.name, call.argsJson);
     if (result.forwarded) forwarded = true;
   }
-  return { text: cleaned, calls, forwarded };
+  return { text: cleaned, calls, forwarded, unparsedMarkup };
 }

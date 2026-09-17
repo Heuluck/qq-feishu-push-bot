@@ -1,9 +1,13 @@
+/**
+ * 飞书侧的转交通道与话题簿记（卡片长什么样在 `./cards.ts`）。
+ */
 import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import * as Lark from "@larksuiteoapi/node-sdk";
-import type { Config } from "./config.js";
-import { larkLogger, log } from "./log.js";
-import { monthKey } from "./retention.js";
+import type { Config } from "../core/config.js";
+import { larkLogger, log } from "../core/log.js";
+import { monthKey } from "../store/retention.js";
+import { buildFollowUpCard, buildRootCard } from "./cards.js";
 
 export interface ForwardRequest {
   summary: string;
@@ -220,10 +224,19 @@ export class FeedbackForwarder {
     }
   }
 
-  /** 幂等集合只在内存里，重启后靠飞书群里的历史卡片兜底，因此设个上限避免无限增长。 */
+  /**
+   * 幂等集合只在内存里，重启后靠飞书群里的历史卡片兜底，因此设个上限避免无限增长。
+   * 满了丢**最旧的**而不是清空：清空会让刚刚转交过的消息又变成「没转过」，重复推一张卡片。
+   */
   private rememberMsgId(msgId: string): void {
-    if (this.pushedMsgIds.size > 5_000) this.pushedMsgIds.clear();
+    // 重新 set 一遍让它排到 Map 末尾，淘汰顺序才是真正的 LRU。
+    this.pushedMsgIds.delete(msgId);
     this.pushedMsgIds.add(msgId);
+    while (this.pushedMsgIds.size > 5_000) {
+      const oldest = this.pushedMsgIds.values().next().value;
+      if (oldest === undefined) break;
+      this.pushedMsgIds.delete(oldest);
+    }
   }
 
   private async appendLog(record: Record<string, unknown>): Promise<void> {
@@ -240,76 +253,13 @@ export class FeedbackForwarder {
 
 /**
  * 话题归属键：同一用户 + 同一主题。
- * 现在模型不再填 topic（话题聚合已弃用），于是每条消息各自独立成键，
- * 不会再把同一个用户的不同问题串到一条话题下面。
+ *
+ * 但**话题聚合当前没有启用**：forward_feedback 的参数里没有 topic，模型填不了这个字段，
+ * 于是每条消息都各自独立成键，同一个用户的不同问题不会被串到一条话题下面。
+ * 卡片、话题回复与 230071 降级这些代码都留着，把 topic 加回工具参数即可生效；
+ * 注意 README 里的「话题聚合」一节与此处是同一件事的两处说明，改动时要一起改。
  */
 export function topicKey(senderId: string, topic: string | undefined, fallbackId: string): string {
   const normalized = (topic ?? "").trim().toLowerCase().replace(/\s+/g, "-");
   return normalized === "" ? `${senderId}::solo-${fallbackId}` : `${senderId}::${normalized}`;
-}
-
-/** 折叠面板：详情、诊断信息默认收起，群里只看到一行问题。 */
-function collapsiblePanel(title: string, elements: Record<string, unknown>[]): Record<string, unknown> {
-  return {
-    tag: "collapsible_panel",
-    expanded: false,
-    header: {
-      title: { tag: "markdown", content: `**${title}**` },
-      vertical_align: "center",
-      icon: { tag: "standard_icon", token: "down-small-ccm_outlined", size: "16px 16px" },
-      icon_position: "right",
-      icon_expanded_angle: -180,
-    },
-    border: { color: "grey", corner_radius: "5px" },
-    padding: "8px 8px 8px 8px",
-    elements,
-  };
-}
-
-function shortSender(senderId: string): string {
-  return senderId.length > 10 ? `${senderId.slice(0, 10)}…` : senderId;
-}
-
-/** 详情 + 诊断信息合并成一个折叠面板，卡片外露的只有问题概要。 */
-function detailPanel(req: ForwardRequest): Record<string, unknown> {
-  const time = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
-  return collapsiblePanel("详情", [
-    { tag: "div", text: { tag: "lark_md", content: req.details } },
-    { tag: "hr" },
-    {
-      tag: "div",
-      text: {
-        tag: "lark_md",
-        content: `**来自**　${shortSender(req.senderId)}　·　${time}\n**openid**　${req.senderId}\n**消息 id**　${req.msgId}`,
-      },
-    },
-  ]);
-}
-
-export function buildRootCard(req: ForwardRequest): Record<string, unknown> {
-  return {
-    config: { wide_screen_mode: true },
-    header: {
-      template: "orange",
-      title: { tag: "plain_text", content: "🔔 QQ 群问题转交" },
-    },
-    elements: [
-      { tag: "div", text: { tag: "lark_md", content: req.summary } },
-      detailPanel(req),
-    ],
-  };
-}
-
-export function buildFollowUpCard(req: ForwardRequest, count: number): Record<string, unknown> {
-  return {
-    config: { wide_screen_mode: true },
-    header: {
-      template: "blue",
-      title: { tag: "plain_text", content: `🔁 补充 #${count}` },
-    },
-    elements: [
-      { tag: "div", text: { tag: "lark_md", content: req.summary } },
-      detailPanel(req),
-    ],
-  };
 }

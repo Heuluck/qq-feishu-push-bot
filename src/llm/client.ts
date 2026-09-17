@@ -1,70 +1,24 @@
+/**
+ * OAI 兼容模型的调用客户端：一次调用完成（不照抄「调工具 → 回灌 → 再要一次」的两轮循环）。
+ *
+ * 请求结构与这样做的理由写在 `complete()` 上；请求 messages 的组装在 `./messages.ts`。
+ */
 import OpenAI from "openai";
-import type {
-  ChatCompletionContentPart,
-  ChatCompletionMessageParam,
-  ChatCompletionTool,
-} from "openai/resources/chat/completions";
-import type { Config } from "./config.js";
-import { log } from "./log.js";
+import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
+import type { Config } from "../core/config.js";
+import { log } from "../core/log.js";
+import { buildMessages } from "./messages.js";
+import type { CompleteInput, CompleteResult, ToolExecutor, ToolRound } from "./messages.js";
 import { runTextToolCalls } from "./toolmarkup.js";
 
-export interface ToolExecutionResult {
-  /** 回填给模型的工具结果文本。 */
-  text: string;
-  /** 是否真的完成了转交（用于兜底文案）。 */
-  forwarded: boolean;
-}
-
-export type ToolExecutor = (name: string, argsJson: string) => Promise<ToolExecutionResult>;
-
-/** 一条消息里的内容片段，按顺序排列：一段文本，或一张图片（data URL）。 */
-export type MessagePart = { text: string } | { image: string };
-
-/** 历史里的一轮对话（不含本轮）。文本已渲染好，图片是 data URL。 */
-export interface LlmTurn {
-  role: "user" | "assistant";
-  parts: MessagePart[];
-  /** 这一轮里做过的工具调用。回放时要还原成 assistant(tool_calls) + tool 消息。 */
-  toolRounds?: ToolRound[];
-}
-
-export interface CompleteInput {
-  /** 历史轮次，按时间从早到晚。为空表示这是本会话第一句。 */
-  history: LlmTurn[];
-  /** 本轮提问的内容片段（文本 + 图片，按展示顺序）。 */
-  userParts: MessagePart[];
-  /** 本轮可用的工具定义。个数与内容都必须稳定，否则会破坏请求前缀缓存。 */
-  tools: ChatCompletionTool[];
-  execTool: ToolExecutor;
-}
-
-export interface CompleteResult {
-  text: string;
-  forwarded: boolean;
-  /** 本轮真的执行过的工具调用，按发生顺序。调用方要把它写进对话缓冲。 */
-  toolRounds: ToolRound[];
-}
-
 /**
- * 一次工具调用及其结果。
- *
- * 字段必须原样保留（尤其是 provider 给的 `id`）：回放历史时要把这一轮重新拼成
- * `assistant(tool_calls)` + `tool` 两个消息，只要和当时逐字节一致，请求前缀就还能命中缓存。
- * 只记「已转交」这类文本是不够的——模型看不到自己**调用过什么**，就会对同一个问题重复转交人工。
+ * 正文形态的调用没有 provider 给的 id（`tool_call_id` 却必须有值，回放时还要与调用配对）。
+ * 造一个够短、又不与别的轮次撞车的：它会跟着历史长期落盘，所以只求稳定唯一，不求可读。
  */
-export interface ToolCallRecord {
-  id: string;
-  name: string;
-  argsJson: string;
-  /** 工具执行结果原文。 */
-  result: string;
-}
-
-/** 一轮模型回复里的工具调用（同一条 assistant 消息可以带多个调用）。 */
-export interface ToolRound {
-  /** 那条 assistant 消息的正文（通常是空字符串，但有的模型会边说边调）。 */
-  content: string;
-  calls: ToolCallRecord[];
+let textCallSeq = 0;
+function textCallId(): string {
+  textCallSeq += 1;
+  return `text-${Date.now().toString(36)}-${textCallSeq.toString(36)}`;
 }
 
 export class LlmClient {
@@ -171,15 +125,32 @@ export class LlmClient {
       const fallback = await this.askForReply(messages, input.tools, input.execTool, deadline);
       lastText = fallback.text;
       if (fallback.forwarded) forwarded = true;
+      // 补答里发生的调用同样要记：不记的话下一轮模型不知道自己转过人工，会重复转交。
+      if (fallback.toolRound.calls.length > 0) toolRounds.push(fallback.toolRound);
     }
 
     // 正文形态的工具调用：模型有时不返回结构化 tool_calls，而是把调用写进正文
     // （原生 <||DSML||…> 标记或散文式一行）。放在最后跑，保证任何来源的文本都被处理：
     // 不处理既会把内部信息发给用户，又会出现「说已转交但其实没转交」。
-    const textCalls = await runTextToolCalls(lastText, (name, argsJson) => input.execTool(name, argsJson));
+    const textRound: ToolRound = { content: "", calls: [] };
+    const textCalls = await runTextToolCalls(lastText, async (name, argsJson) => {
+      const result = await input.execTool(name, argsJson);
+      textRound.calls.push({ id: textCallId(), name, argsJson, result: result.text });
+      return result;
+    });
     if (textCalls.forwarded) forwarded = true;
     if (textCalls.calls.length > 0) {
       log.warn("llm", `模型把工具调用写成了正文，已解析并执行 ${textCalls.calls.length} 个：${textCalls.calls.map((c) => c.name).join(", ")}`);
+      // 用户实际看到的那段正文 + 这一轮的调用结果都要进历史（同 tool_calls 那条路径）：
+      // 少了它，模型下一轮看不到自己转过人工，会对同一个问题重复转交。
+      textRound.content = textCalls.text;
+      toolRounds.push(textRound);
+    }
+    if (textCalls.unparsedMarkup) {
+      log.warn(
+        "llm",
+        "正文里有工具调用标记，但没能解析出调用名（标记已从回复中剔除，这次调用**没有执行**）：检查模型是否换了写法",
+      );
     }
     lastText = textCalls.text;
 
@@ -189,13 +160,17 @@ export class LlmClient {
   /**
    * 追加一句要求，让模型自己补一句给用户的回复（不写死文案）。
    * 必须把工具一起传下去：不给工具时，上下文里「答不了就转交」的要求会让它只能把调用写成正文。
+   *
+   * 这里发生的工具调用同样要回传给调用方（`toolRound`）：它和第一轮一样会真的转交人工，
+   * 只回传文本的话，下一轮模型就不知道自己已经转过谁了。
    */
   private async askForReply(
     messages: ChatCompletionMessageParam[],
     tools: ChatCompletionTool[],
     execTool: ToolExecutor,
     signal: AbortSignal,
-  ): Promise<{ text: string; forwarded: boolean }> {
+  ): Promise<{ text: string; forwarded: boolean; toolRound: ToolRound }> {
+    const emptyRound: ToolRound = { content: "", calls: [] };
     try {
       const res = await this.client.chat.completions.create(
         {
@@ -217,17 +192,26 @@ export class LlmClient {
       );
       this.logUsage(res.usage);
       const choice = res.choices[0]?.message;
+      const text = (choice?.content ?? "").trim();
+      const toolRound: ToolRound = { content: text, calls: [] };
       let forwarded = false;
       for (const call of (choice?.tool_calls ?? []).filter((item) => item.type === "function")) {
         const result = await execTool(call.function.name, call.function.arguments);
         if (result.forwarded) forwarded = true;
+        toolRound.calls.push({
+          id: call.id,
+          name: call.function.name,
+          argsJson: call.function.arguments,
+          result: result.text,
+        });
       }
-      return { text: (choice?.content ?? "").trim(), forwarded };
+      return { text, forwarded, toolRound };
     } catch (err) {
       log.warn("llm", `补一次回复失败：${err instanceof Error ? err.message : String(err)}`);
-      return { text: "", forwarded: false };
+      return { text: "", forwarded: false, toolRound: emptyRound };
     }
   }
+
 
   /** 记录 token 与缓存命中情况，用来观察前缀缓存是否生效。 */
   private logUsage(usage: unknown): void {
@@ -240,62 +224,4 @@ export class LlmClient {
       `tokens prompt=${u["prompt_tokens"] ?? "?"}（缓存命中=${cached ?? "?"}）completion=${u["completion_tokens"] ?? "?"}`,
     );
   }
-}
-
-/**
- * 把「system + 历史轮次 + 本轮」组装成请求的 messages。
- *
- * 历史是**逐字节稳定、只往后追加**的前缀，所以能被厂商的前缀缓存命中，只有最新那一轮按原价计费。
- * 反过来，如果把历史拼成一段文本塞进当前那条 user 消息，它每轮都变，缓存全废。
- */
-export function buildMessages(input: CompleteInput, systemPrompt: string): ChatCompletionMessageParam[] {
-  const messages: ChatCompletionMessageParam[] = [{ role: "system", content: systemPrompt }];
-  for (const turn of input.history) {
-    if (turn.role === "assistant") {
-      // 工具轮要还原成当时的形状：assistant(tool_calls) + 每个调用一条 tool。
-      // id / 参数 / 结果都按原样回放，这样这轮请求的前缀和上一轮逐字节一致，缓存能继续往后接。
-      for (const round of turn.toolRounds ?? []) {
-        messages.push({
-          role: "assistant",
-          content: round.content,
-          tool_calls: round.calls.map((call) => ({
-            id: call.id,
-            type: "function" as const,
-            function: { name: call.name, arguments: call.argsJson },
-          })),
-        });
-        for (const call of round.calls) {
-          messages.push({ role: "tool", tool_call_id: call.id, content: call.result });
-        }
-      }
-      // 机器人自己只发文本，不带图。
-      messages.push({ role: "assistant", content: plainText(turn.parts) });
-      continue;
-    }
-    messages.push({ role: "user", content: toContent(turn.parts) });
-  }
-  messages.push({ role: "user", content: toContent(input.userParts) });
-  return messages;
-}
-
-/**
- * 把内容片段转成 OpenAI 的 content。
- * 只有一段文本时直接给字符串：更紧凑，也和大多数框架写出来的历史一致，便于命中前缀缓存。
- */
-function toContent(parts: MessagePart[]): string | ChatCompletionContentPart[] {
-  const [only] = parts;
-  if (parts.length === 1 && only !== undefined && "text" in only) return only.text;
-  return parts.map((part) =>
-    "text" in part
-      ? ({ type: "text", text: part.text } as const)
-      : ({ type: "image_url", image_url: { url: part.image } } as const),
-  );
-}
-
-/** 只取文本片段（assistant 轮从不带图）。 */
-function plainText(parts: MessagePart[]): string {
-  return parts
-    .filter((part): part is { text: string } => "text" in part)
-    .map((part) => part.text)
-    .join("\n");
 }

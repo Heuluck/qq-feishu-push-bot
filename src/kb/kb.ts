@@ -128,8 +128,10 @@ function versionOf(raw: string): string {
 function renderBlock(entries: KbEntry[]): string {
   const out: string[] = [];
   for (const entry of entries) {
-    // 条目 id 一并给模型，转交时用它做话题标识，实现「同一主题聚合到一条话题」。
-    out.push(`## ${entry.title}（id: ${entry.id}）`);
+    // 条目 id 不外发给模型：转交话题聚合当前没有启用（forward_feedback 的参数里没有 topic，
+    // 模型填不了，见 lark/forwarder.ts 的 topicKey），写进提示词只会白占 token。
+    // id 仍留在 kb.yaml 里当条目的稳定标识（日志用，将来要重新启用聚合时也用它）。
+    out.push(`## ${entry.title}`);
     out.push(`关键词：${entry.keywords.join("、")}`);
     out.push(`处理方式：${ROUTE_LABEL[entry.route]}`);
     if (entry.answer) out.push(`答案：${entry.answer}`);

@@ -1,6 +1,6 @@
 import { appendFile, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
-import { log } from "./log.js";
+import { log } from "../core/log.js";
 
 /**
  * 数据文件的命名、切分与保留策略。
