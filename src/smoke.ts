@@ -14,7 +14,17 @@ import { loadKnowledgeBase } from "./kb.js";
 import { Limits } from "./limits.js";
 import { buildMessages } from "./llm.js";
 import { clearPreparedImageCache, prepareImages, prepareImageUrls, quotedImageUrls, resizeImageBuffer } from "./media.js";
-import { EXPOSED_TOOLS, buildUserText, createSerialQueue, ensureQuotaNotice, platformBackground, splitReply } from "./qq.js";
+import {
+  EXPOSED_TOOLS,
+  buildUserText,
+  createArrivalTracker,
+  createSerialQueue,
+  ensureQuotaNotice,
+  needsQuote,
+  platformBackground,
+  sendMainReply,
+  splitReply,
+} from "./qq.js";
 import { FILE_PATTERNS, dayKey, migrateLegacyForwards, monthKey, pruneByAge, stampKey } from "./retention.js";
 import { stripMentions, truncateText } from "./text.js";
 import { extractTextToolCalls, runTextToolCalls } from "./toolmarkup.js";
@@ -257,6 +267,48 @@ check(
   "长回复按段落拆分",
   longReply.length > 1600 && chunks.length > 1 && chunks.every((c) => c.length <= 1600),
   `${longReply.length} 字符 → ${chunks.length} 段`,
+);
+
+// 5b. 回复的引用（期间群里有人插话时，引用回那条 @ 消息）
+const arrivals = createArrivalTracker();
+const mine = arrivals.mark("G1");
+check("引用判断：刚收到还没生成时不需要引用", !needsQuote(arrivals, "G1", mine));
+arrivals.mark("G1");
+check("引用判断：生成期间群里又进了消息 → 引用", needsQuote(arrivals, "G1", mine));
+
+const otherGroup = createArrivalTracker();
+const mineB = otherGroup.mark("G1");
+otherGroup.mark("G2");
+check("引用判断：别的群进消息不算这个群的新消息", !needsQuote(otherGroup, "G1", mineB));
+check("引用判断：没拿到自己的序号时不引用", !needsQuote(otherGroup, "G1", undefined));
+
+const sent: string[] = [];
+const recording = (kind: string) => async (content: string): Promise<void> => {
+  sent.push(`${kind}:${content}`);
+};
+await sendMainReply({ plain: recording("plain"), quoted: recording("quoted") }, ["甲", "乙"], false);
+check("引用发送：不需要引用时全部走普通回复", sent.join(" ") === "plain:甲 plain:乙", sent.join(" "));
+
+sent.length = 0;
+await sendMainReply({ plain: recording("plain"), quoted: recording("quoted") }, ["甲", "乙"], true);
+check("引用发送：需要引用时每段都带引用", sent.join(" ") === "quoted:甲 quoted:乙", sent.join(" "));
+
+sent.length = 0;
+await sendMainReply(
+  {
+    plain: recording("plain"),
+    quoted: async (content: string) => {
+      if (content === "甲") throw new Error("API Error: message_reference 不支持");
+      sent.push(`quoted:${content}`);
+    },
+  },
+  ["甲", "乙"],
+  true,
+);
+check(
+  "引用发送：平台拒绝引用时退回普通回复，答案照样发出去",
+  sent.join(" ") === "plain:甲 quoted:乙",
+  sent.join(" "),
 );
 
 const userText = buildUserText({

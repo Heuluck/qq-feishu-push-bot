@@ -1,4 +1,5 @@
 import {
+  MsgType,
   QQBot,
   contentSanitizer,
   errorHandler,
@@ -94,6 +95,82 @@ export function splitReply(text: string, max = MAX_REPLY_CHARS, maxChunks = 3): 
 }
 
 /**
+ * 每个群里「最近一条进来的消息」的序号。
+ *
+ * 只服务于一个判断：**从收到这条 @ 消息、到答案生成完毕准备发送，这中间群里有没有人插话**。
+ * 平台把同一 `msg_id` 的多条回复排在触发消息下面，一旦有人插话，机器人的回复就飘在新消息上面、
+ * 群里看不出它在回谁——这时要显式引用那条 @ 消息（见 `sendMainReply`）。
+ */
+export interface ArrivalTracker {
+  /** 记一条刚收到的群消息，返回该群的新序号——调用方把它当作「我这条」的序号留着。 */
+  mark(groupId: string): number;
+  /** 这个序号之后，该群是否又进过消息。 */
+  hasNewArrival(groupId: string, seq: number): boolean;
+}
+
+/** 久未活跃的群，簿记留 30 分钟即可：比任何一次「生成 + 发送」的时长都宽裕得多。 */
+const ARRIVAL_TTL_MS = 30 * 60_000;
+
+export function createArrivalTracker(): ArrivalTracker {
+  // 序号全局递增，每个群只记「自己最后一条」：别的群进消息不会让这个群误判。
+  let nextSeq = 1;
+  const last = new Map<string, { seq: number; at: number }>();
+  return {
+    mark(groupId: string): number {
+      const seq = nextSeq++;
+      last.set(groupId, { seq, at: Date.now() });
+      // 机器人进的群会一直变多，簿记只该跟「最近活跃的群数」有关：攒到一定量就清掉久未发言的。
+      if (last.size > 200) {
+        const deadline = Date.now() - ARRIVAL_TTL_MS;
+        for (const [key, entry] of last) {
+          if (entry.at < deadline) last.delete(key);
+        }
+      }
+      return seq;
+    },
+    hasNewArrival(groupId: string, seq: number): boolean {
+      const entry = last.get(groupId);
+      return entry !== undefined && entry.seq > seq;
+    },
+  };
+}
+
+/** 该群在「我这条」之后又进过消息 → 回复要引用回那条 @ 消息。 */
+export function needsQuote(arrivals: ArrivalTracker, groupId: string, ownSeq: unknown): boolean {
+  return typeof ownSeq === "number" && arrivals.hasNewArrival(groupId, ownSeq);
+}
+
+/** 发一条回复的两条通道：不带引用 / 带引用。 */
+export interface ReplyChannel {
+  /** 普通被动回复（`bot.sendText`）。 */
+  plain: (content: string) => Promise<unknown>;
+  /** 带 `message_reference` 的被动回复（`bot.send`）——`sendText` 没有这个参数。 */
+  quoted: (content: string) => Promise<unknown>;
+}
+
+/**
+ * 发主回复的各段，`quote` 为真时每段都引用回那条 @ 消息。
+ *
+ * 引用发不出去时退回普通回复：引用只是为了「让这条挂在原问题下面」，宁可少个引用，
+ * 也不能把答案吞掉（外层 errorHandler 只会回一句「出了点小问题」）。代价是万一「已送达但响应丢失」，
+ * 用户会看到两条一样的——比收不到答案轻得多。补充消息（`send_followup`）不走这里，不需要引用。
+ */
+export async function sendMainReply(channel: ReplyChannel, chunks: string[], quote: boolean): Promise<void> {
+  for (const chunk of chunks) {
+    if (!quote) {
+      await channel.plain(chunk);
+      continue;
+    }
+    try {
+      await channel.quoted(chunk);
+    } catch (err) {
+      log.warn("qq", `带引用的回复没发出去，退回普通回复：${err instanceof Error ? err.message : String(err)}`);
+      await channel.plain(chunk);
+    }
+  }
+}
+
+/**
  * 暴露给模型的工具定义。个数与内容必须稳定，否则会破坏请求前缀缓存。
  *
  * `SEND_FOLLOWUP_TOOL` 是「模型想多发一条消息」的出口：正文之外再排一条，由 `qq.ts` 在正文之后发出。
@@ -167,6 +244,7 @@ export interface QqDeps {
 export function createQqBot(deps: QqDeps): QQBot {
   const { cfg, llm, forwarder, limits, history, systemPrompt } = deps;
   const enqueue = createSerialQueue();
+  const arrivals = createArrivalTracker();
   const bot = new QQBot({
     appId: cfg.QQBOT_APP_ID,
     appSecret: cfg.QQBOT_APP_SECRET,
@@ -176,6 +254,13 @@ export function createQqBot(deps: QqDeps): QQBot {
   // errorHandler 放在最前面：下游任何异常都会兜底回复一条友好提示，并重新抛出交给 bot.on("error") 记日志。
   bot.use(errorHandler({ format: () => "抱歉，这边刚出了点小问题，麻烦再发一次喵~", rethrow: true }));
   bot.use(messageFilter({ skipSelfEcho: true, dedup: { windowMs: 30_000, maxSize: 2_000 } }));
+  // 每条进来的群消息先记一笔（含不 @ 机器人的普通消息），发送前据此判断这期间群里有没有人插话。
+  // 放在 messageFilter 之后：机器人自己的回显与被去重的重复推送不算「新消息」。
+  bot.use((ctx, next) => {
+    const m = ctx.message;
+    if (m.kind === "group") ctx.state["arrivalSeq"] = arrivals.mark(m.groupOpenid ?? "");
+    return next();
+  });
   // 不折叠空白：用户粘贴的报错日志/堆栈靠换行保持结构，折成一行会丢信息。
   // transform 兜底清洗十六进制形态的 @ 标记（SDK 内置规则只认纯数字形态）。
   bot.use(
@@ -237,6 +322,9 @@ export function createQqBot(deps: QqDeps): QQBot {
       log.debug("qq", `忽略非目标群消息：group=${msg.groupOpenid ?? "?"}`);
       return;
     }
+
+    // 这条消息进来时的序号（上面那个中间件记的）。发送前拿它判断期间群里有没有人插话。
+    const myArrivalSeq = ctx.state["arrivalSeq"];
 
     // 同步申请配额：被拒时直接返回，不会下载图片、不会解析上下文、更不会调用模型。
     const decision = limits.reserve(msg.senderId, msg.groupOpenid);
@@ -428,9 +516,25 @@ export function createQqBot(deps: QqDeps): QQBot {
       );
       // 有补充消息时先给它留一条：主回复的分段数 + 补充消息要一起落在平台那 5 条以内。
       const maxMainChunks = Math.max(1, Math.min(cfg.REPLY_MAX_CHUNKS, MAX_PASSIVE_REPLIES - tools.followups.length));
-      for (const chunk of splitReply(reply, MAX_REPLY_CHARS, maxMainChunks)) {
-        await bot.sendText(msg.replyTarget, chunk);
-      }
+      // 从收到这条 @ 消息、到答案生成完毕，中间群里又有人说话 → 被动回复会飘在新消息上面，
+      // 群里看不出这句话是回谁的。这时给正文带上 message_reference，引用回那条 @ 消息。
+      // 判断全在代码里做：模型不参与，也不需要它产出引用；补充消息不引用。
+      const quoteTrigger = needsQuote(arrivals, msg.groupOpenid ?? "", myArrivalSeq);
+      if (quoteTrigger) log.info("qq", "这期间群里又进了消息，回复将引用那条 @ 消息");
+      await sendMainReply(
+        {
+          plain: (content) => bot.sendText(msg.replyTarget, content),
+          quoted: (content) =>
+            bot.send({
+              target: msg.replyTarget,
+              msgType: MsgType.TEXT,
+              content,
+              messageReference: { message_id: msg.messageId },
+            }),
+        },
+        splitReply(reply, MAX_REPLY_CHARS, maxMainChunks),
+        quoteTrigger,
+      );
       // 补充消息在主回复**之后**单独发出：模型想「答案一条、转交说明一条」时用它。
       for (const extra of tools.followups) {
         log.info("qq", `补充消息：${extra.slice(0, 60)}`);
@@ -450,6 +554,7 @@ export function createQqBot(deps: QqDeps): QQBot {
         "qq",
         `回复完成 ${Date.now() - started}ms｜转交=${result.forwarded}｜工具轮 ${result.toolRounds.length}` +
           `（${result.toolRounds.flatMap((r) => r.calls.map((c) => c.name)).join(",") || "无"}）` +
+          `｜引用那条@=${quoteTrigger ? "是" : "否"}` +
           `｜历史 ${historyTurns.length} 轮（历史图 ${historyImageCount} 张）｜本图 消息 ${prepared.images.length}/${attachments.length}` +
           `、引用 ${fromQuote.images.length}/${quotedImages.length}｜新读 ${downloaded} 张` +
           `（缓存 ${prepared.cached + fromQuote.cached + fromContext.cached}）｜平台背景=${platformContext.text !== ""}`,
