@@ -62,6 +62,13 @@ entries:
     answer: |
       课表每日同步，刚选退课需要等待明天同步，请以教务系统为准。可对比教务系统（{{jwpt}}）-「学期理论课表」查看是否确有此课；如果教务系统中的课程信息有误，请联系教务处 {{jwpt-phone}}，如果只有南大家园未同步，请直接反馈给我们。
 
+  - id: schedule-adjustment
+    title: 调休 / 补课安排
+    keywords: [调休, 补课, 调课]
+    route: answer
+    answer: |
+      南大家园目前没有自动调休功能，课表不会根据调休自动改动。具体上课安排请以教务处通知和教务系统为准。
+
   - id: major-change-not-sync
     title: 转专业后资料未同步
     keywords: [转专业]
@@ -125,7 +132,7 @@ entries:
     keywords: [电费, 电]
     route: answer
     answer: |
-      请联系学校水电中心 0791-83969182 或 15797965280 (金老师)
+      请联系学校水电中心售电咨询服务电话 0791-83969182 或 15797965280 (金老师)
   
   - id: select-course-on-incu
     title: 南大家园的选课是真的吗
