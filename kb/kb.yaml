@@ -83,6 +83,13 @@ entries:
     answer: |
       请以教务系统（{{jwpt}}）绩点为准。
 
+  - id: no-credit
+    title: 绩点不显示
+    keywords: [绩点]
+    route: answer
+    answer: |
+      请在教务系统（{{jwpt}}）查询绩点。
+
   - id: download
     title: 下载南大家园
     keywords: [下载, 更新]
