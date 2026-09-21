@@ -92,10 +92,17 @@ entries:
 
   - id: download
     title: 下载南大家园
-    keywords: [下载, 更新]
+    keywords: [下载]
     route: answer
     answer: |
       请在 {{app-download}} 下载最新版南大家园（当前版本 {{latest-version}}），{{app-package-hint}}
+
+  - id: update
+    title: 无法更新南大家园
+    keywords: [更新]
+    route: answer
+    answer: |
+      请在 {{app-download}} 下载最新版南大家园（当前版本 {{latest-version}}），{{app-package-hint}}，最新版已经解决无法应用内更新的问题。
 
   - id: wrong-timeline
     title: 上课时间不对
