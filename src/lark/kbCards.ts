@@ -286,24 +286,24 @@ export function buildMenuCard(state: KbState, sign: ActionSigner): Card {
 /** 第一步：基本信息 + 处理方式。点「下一步」时才决定第二步要填哪个框。 */
 export function buildStep1Card(sign: ActionSigner, draft: WizardDraft): Card {
   return card({ title: "新增补充知识 1/2", template: "turquoise" }, [
-    md("下一步只填所选处理方式对应的那一项。"),
+    md("先填基本信息，下一步再填答案或转交说明。"),
     {
       tag: "form",
       name: "kb_step1",
       elements: [
-        inputField("id", "id（必填，全局唯一）", {
+        inputField("id", "id", {
           required: true,
           max: MAX_ID_CHARS,
           placeholder: "如 feishu-jwpt-phone",
           value: draft.id,
         }),
-        inputField("title", "标题（必填）", {
+        inputField("title", "标题", {
           required: true,
           max: MAX_TITLE_CHARS,
           placeholder: "如 教务系统打不开",
           value: draft.title,
         }),
-        inputField("keywords", "关键词（必填，逗号分隔）", {
+        inputField("keywords", "关键词", {
           required: true,
           max: MAX_KEYWORDS_CHARS,
           placeholder: "如 教务,打不开,登录不上",
@@ -311,14 +311,14 @@ export function buildStep1Card(sign: ActionSigner, draft: WizardDraft): Card {
         }),
         // select_static 没有 label 属性（只有 input 有），所以标签用一个 markdown 兄弟节点，
         // 这也是官方表单示例里的写法。
-        md("**处理方式（必填）**"),
+        md("**处理方式**"),
         routeSelect(draft),
         buttons([submitButton("下一步", "primary_filled", "kb_next", draftValue(sign, OP.wizardNext, draft))]),
       ],
     },
     md(
-      `id 限字母、数字、下划线、短横线，≤ ${MAX_ID_CHARS} 字；标题 ≤ ${MAX_TITLE_CHARS} 字；` +
-        `关键词合计 ≤ ${MAX_KEYWORDS_CHARS} 字。`,
+      `id 全局唯一，只能用字母、数字、下划线、短横线（≤ ${MAX_ID_CHARS} 字）；` +
+        `标题 ≤ ${MAX_TITLE_CHARS} 字；关键词用逗号分隔、合计 ≤ ${MAX_KEYWORDS_CHARS} 字。`,
     ),
   ]);
 }
@@ -329,20 +329,22 @@ export function buildStep1Card(sign: ActionSigner, draft: WizardDraft): Card {
  * form_value 一起提交」文档没写清楚——权威值本来就在按钮的签名值里，展示用文本最省事）。
  */
 export function buildStep2Card(draft: WizardDraft, sign: ActionSigner): Card {
+  const askAnswer = draft.route === "answer" || draft.route === "answer_and_forward";
+  const askForward = draft.route === "forward" || draft.route === "answer_and_forward";
   const fields: unknown[] = [];
-  if (draft.route === "answer" || draft.route === "answer_and_forward") {
+  if (askAnswer) {
     fields.push(
-      inputField("answer", "答案（发给同学的）", {
+      inputField("answer", "答案", {
         multiline: true,
         max: MAX_ANSWER_CHARS,
-        placeholder: "不要写内部信息",
+        placeholder: "如：先连校园网再试一次",
         value: draft.answer,
       }),
     );
   }
-  if (draft.route === "forward" || draft.route === "answer_and_forward") {
+  if (askForward) {
     fields.push(
-      inputField("forward_hint", "转交说明（给处理人员）", {
+      inputField("forward_hint", "转交说明", {
         multiline: true,
         max: MAX_FORWARD_HINT_CHARS,
         placeholder: "如：学号、报错截图",
@@ -360,7 +362,13 @@ export function buildStep2Card(draft: WizardDraft, sign: ActionSigner): Card {
         `**处理方式**　${routeLabel(draft.route)}`,
       ].join("\n"),
     ),
-    md("要改点「上一步」，已填内容会带回去。"),
+    // 提示只讲这次真的出现的字段，别在「只填答案」时还念一遍转交说明。
+    md(
+      [
+        ...(askAnswer ? ["答案会回复给同学"] : []),
+        ...(askForward ? ["转交说明只给处理人员看"] : []),
+      ].join("；") + "。要改内容点「上一步」。",
+    ),
     {
       tag: "form",
       name: "kb_step2",
