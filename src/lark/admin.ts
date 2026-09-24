@@ -92,11 +92,44 @@ function errorText(err: unknown): string {
 /** 保留最近多少条消息 id / 回调 id，用来挡住飞书的重复推送。 */
 const SEEN_CAP = 5_000;
 
+export interface AdminAcl {
+  /** `*`：群里任何人都能操作。 */
+  wildcard: boolean;
+  /** 逐个授权的 open_id。 */
+  ids: Set<string>;
+  /** 配置有问题时给启动日志看的一句话（空串表示没问题）。 */
+  problem: string;
+}
+
+/**
+ * 解析 `LARK_ADMIN_OPEN_IDS`。
+ *
+ * `*` 表示「反馈群里所有人都能改知识库」，但它**必须**和 `LARK_FEEDBACK_CHAT_ID` 一起配：
+ * 不显式指定群的话，群是启动时自动认出来的，一旦机器人被拉进别的群、或认错了群，
+ * 通配就等于把知识库开放给了意料之外的人。所以这里fail closed——少配一样就谁都不授权。
+ */
+export function parseAdminIds(raw: string, feedbackChatId: string): AdminAcl {
+  const items = raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item !== "");
+  const ids = new Set(items.filter((item) => item !== "*"));
+  if (!items.includes("*")) return { wildcard: false, ids, problem: "" };
+  if (feedbackChatId === "") {
+    return {
+      wildcard: false,
+      ids,
+      problem: "LARK_ADMIN_OPEN_IDS 含 *，但没有设置 LARK_FEEDBACK_CHAT_ID，通配不生效（现在谁都操作不了）",
+    };
+  }
+  return { wildcard: true, ids, problem: "" };
+}
+
 export class LarkKbAdmin {
   private readonly client: Lark.Client;
   private readonly ws: Lark.WSClient;
   private readonly store: FeishuKbStore;
-  private readonly admins: Set<string>;
+  private readonly acl: AdminAcl;
   private chatId: string | undefined;
   /** 最近一次发出的主菜单消息 id。卡片内容变了就靠它原地刷新（`message.patch`）。 */
   private menuMessageId: string | undefined;
@@ -119,12 +152,12 @@ export class LarkKbAdmin {
       logger: larkLogger,
       loggerLevel: Lark.LoggerLevel.info,
     });
-    this.store = new FeishuKbStore(cfg.KB_FEISHU_PATH, cfg.DATA_DIR);
-    this.admins = new Set(
-      cfg.LARK_ADMIN_OPEN_IDS.split(",")
-        .map((item) => item.trim())
-        .filter((item) => item !== ""),
-    );
+    this.store = new FeishuKbStore({
+      layer: cfg.KB_FEISHU_PATH,
+      trash: cfg.KB_FEISHU_TRASH_PATH,
+      dataDir: cfg.DATA_DIR,
+    });
+    this.acl = parseAdminIds(cfg.LARK_ADMIN_OPEN_IDS, cfg.LARK_FEEDBACK_CHAT_ID ?? "");
   }
 
   /** 建长连接。任何失败都只记日志——知识库管理挂了不能连带把 QQ 机器人拖死。 */
@@ -138,13 +171,17 @@ export class LarkKbAdmin {
       return;
     }
     this.chatId = chatId;
-    if (this.admins.size === 0) {
+    if (this.acl.problem !== "") {
+      log.warn("kb-admin", this.acl.problem);
+    } else if (this.acl.wildcard) {
+      log.warn("kb-admin", `LARK_ADMIN_OPEN_IDS=*：${chatId} 群里任何人都能增删飞书补充知识`);
+    } else if (this.acl.ids.size === 0) {
       log.warn(
         "kb-admin",
         "LARK_ADMIN_OPEN_IDS 为空：现在谁点菜单都不会生效。@机器人 时会把 open_id 打进日志，复制进 .env 即可授权",
       );
     } else {
-      log.info("kb-admin", `知识库管理员 ${this.admins.size} 人，操作群 ${chatId}`);
+      log.info("kb-admin", `知识库管理员 ${this.acl.ids.size} 人，操作群 ${chatId}`);
     }
 
     await this.logChatMode();
@@ -267,6 +304,8 @@ export class LarkKbAdmin {
           return await this.onToggle(messageId);
         case OP.del:
           return await this.onDelete(openId, verified.payload, messageId);
+        case OP.remove:
+          return await this.onRemove(openId, verified.payload, messageId);
         default:
           return toast("warning", `未知操作：${op === "" ? "(空)" : op}`);
       }
@@ -310,7 +349,7 @@ export class LarkKbAdmin {
   /** 查看补充条目。 */
   private async onList(messageId: string): Promise<CallbackResponse> {
     const { file } = await this.store.load();
-    await this.replyCard(messageId, buildEntryListCard(this.state(), file.entries), { inThread: true });
+    await this.replyCard(messageId, buildEntryListCard(this.state(), file.entries, this.sign), { inThread: true });
     return toast("info", "已发到下方话题");
   }
 
@@ -341,15 +380,19 @@ export class LarkKbAdmin {
     if (!check.ok) return toast("error", check.reason);
     const entry = check.entry;
 
+    // 先入回收站再改补充层：反过来中间挂掉就丢内容了。写回收站失败会抛错，直接不删。
+    const trashId = await this.store.trash(entry, openId);
     const next: FeishuLayerFile = { ...file, entries: file.entries.filter((item) => item.id !== id) };
     await this.store.save(next);
     await this.kb.reload();
     await this.store.audit({
       action: "delete",
+      via: "undo",
       id: entry.id,
       title: entry.title,
       actor: openId,
       added_by: entry.added_by ?? "",
+      trash_id: trashId,
       source_message: messageId,
     });
 
@@ -358,10 +401,52 @@ export class LarkKbAdmin {
     void this.refreshMenu();
     void this.replyCard(
       messageId,
-      buildResultCard(true, `已删除：${entry.title}`, [`**id**　\`${entry.id}\``]),
+      buildResultCard(true, `已删除：${entry.title}`, [`**原 id**　\`${entry.id}\``, `**回收站 id**　\`${trashId}\``]),
       { inThread: true },
     );
     return toastWithCard("success", `已删除「${entry.title}」`, buildDeletedCard(entry));
+  }
+
+  /**
+   * 删除列表里的任意一条（列表卡片上每条自带的「删除」按钮）。
+   *
+   * 和上面的撤销不同，这条**没有时间窗口**：它的入口就是"查看补充知识"那张卡，
+   * 删除是明确的意图，不是误触回退。客户端那边有原生二次确认弹窗兜着。
+   */
+  private async onRemove(openId: string, payload: Record<string, unknown>, messageId: string): Promise<CallbackResponse> {
+    const id = typeof payload["id"] === "string" ? payload["id"] : "";
+    if (id === "") return toast("error", "缺少条目 id");
+
+    const { file } = await this.store.load();
+    const entry = file.entries.find((item) => item.id === id);
+    if (entry === undefined) return toast("error", `id「${id}」已不存在（可能已被删除）`);
+
+    const trashId = await this.store.trash(entry, openId);
+    const next: FeishuLayerFile = { ...file, entries: file.entries.filter((item) => item.id !== id) };
+    await this.store.save(next);
+    await this.kb.reload();
+    await this.store.audit({
+      action: "delete",
+      via: "list",
+      id: entry.id,
+      title: entry.title,
+      route: entry.route,
+      actor: openId,
+      trash_id: trashId,
+      source_message: messageId,
+    });
+    log.info("kb-admin", `飞书补充知识删除：${entry.id}（${entry.title}）→ 回收站 ${trashId}，操作者 ${openId}`);
+
+    // 原地把那张列表卡刷新一遍（被删的那行消失），另外新发一张结果卡片。
+    // 结果卡片不是多余的：回收站里的新 id 得让人看得见，否则事后没法在 yaml 里对上。
+    void this.refreshMenu();
+    void this.replyCard(
+      messageId,
+      buildResultCard(true, `已删除：${entry.title}`, [`**原 id**　\`${entry.id}\``, `**回收站 id**　\`${trashId}\``]),
+      { inThread: true },
+    );
+    const { file: after } = await this.store.load();
+    return toastWithCard("success", `已删除「${entry.title}」`, buildEntryListCard(this.state(), after.entries, this.sign));
   }
 
   /** 向导第二步的提交：合并草稿 → 校验 → 写盘 → 热重载 → 结果卡片。 */
@@ -555,7 +640,8 @@ export class LarkKbAdmin {
   }
 
   private isAdmin(openId: string): boolean {
-    return openId !== "" && this.admins.has(openId);
+    if (openId === "") return false;
+    return this.acl.wildcard || this.acl.ids.has(openId);
   }
 
   private get sign(): (payload: Record<string, unknown>) => Record<string, unknown> {

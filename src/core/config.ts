@@ -130,6 +130,8 @@ const EnvSchema = z.object({
    * 基线随镜像走、只由人手工改；这一份由群里的管理菜单写，随时能一键停用或回滚。
    */
   KB_FEISHU_PATH: z.string().trim().min(1).default("kb/kb.feishu.yaml"),
+  /** 卡片上删掉的条目归档到这里，只增不改；程序不会自动恢复。 */
+  KB_FEISHU_TRASH_PATH: z.string().trim().min(1).default("kb/kb.feishu.trash.yaml"),
   /** 是否在飞书群里开知识库管理菜单（需要开发者后台配好长连接的事件与回调订阅）。 */
   KB_ADMIN_ENABLED: z
     .enum(["true", "false"])

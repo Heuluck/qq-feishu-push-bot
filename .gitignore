@@ -12,3 +12,4 @@ deploy.sh
 # 飞书补充知识库：运行期由群里的管理菜单写出来，属于**每台服务器各自的状态**，
 # 不该跟着仓库走（deploy.sh 的 tar 也把它排除了，不会拿本机的试验内容覆盖线上）。
 kb/kb.feishu.yaml
+kb/kb.feishu.trash.yaml

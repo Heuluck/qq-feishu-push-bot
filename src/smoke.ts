@@ -14,11 +14,13 @@ import {
   FeishuKbStore,
   checkDeletable,
   parseFeishuFileText,
+  parseTrashFileText,
   renderFeishuFileText,
   signActionValue,
   verifyActionValue,
 } from "./kb/feishu.js";
 import type { FeishuLayerFile } from "./kb/feishu.js";
+import { parseAdminIds } from "./lark/admin.js";
 import {
   EMPTY_DRAFT,
   OP,
@@ -1452,12 +1454,27 @@ check(
 );
 check(
   "查看卡片：条目收在折叠面板里（默认收起，不刷屏）",
-  JSON.stringify(buildEntryListCard(state, delEntries)).includes('"collapsible_panel"') &&
-    JSON.stringify(buildEntryListCard(state, delEntries)).includes('"expanded":false'),
+  JSON.stringify(buildEntryListCard(state, delEntries, identitySign)).includes('"collapsible_panel"') &&
+    JSON.stringify(buildEntryListCard(state, delEntries, identitySign)).includes('"expanded":false'),
 );
 check(
   "查看卡片：空库时给一句话，不给空白卡片",
-  JSON.stringify(buildEntryListCard({ ...state, feishuCount: 0 }, [])).includes("为空"),
+  JSON.stringify(buildEntryListCard({ ...state, feishuCount: 0 }, [], identitySign)).includes("为空"),
+);
+check(
+  "查看卡片：每条都带「删除」按钮，回传 kb.remove 并要求二次确认",
+  (() => {
+    const card = buildEntryListCard(state, delEntries, identitySign);
+    const ops = collectActions(card);
+    return (
+      ops.some((value) => value["op"] === "kb.remove" && value["id"] === "card-added") &&
+      JSON.stringify(card).includes('"confirm"')
+    );
+  })(),
+);
+check(
+  "查看卡片：说明了删除会进回收站且不会自动恢复",
+  JSON.stringify(buildEntryListCard(state, delEntries, identitySign)).includes("回收站"),
 );
 check(
   "切换卡片：标题随目标状态变化",
@@ -1469,7 +1486,8 @@ check(
 const storeRoot = "data/smoke-tmp/feishu-store";
 rmSync(storeRoot, { recursive: true, force: true });
 const storePath = join(storeRoot, "kb", "kb.feishu.yaml");
-const store = new FeishuKbStore(storePath, join(storeRoot, "data"));
+const storeTrashPath = join(storeRoot, "kb", "kb.feishu.trash.yaml");
+const store = new FeishuKbStore({ layer: storePath, trash: storeTrashPath, dataDir: join(storeRoot, "data") });
 const storeEntry = (id: string): FeishuKbEntry => ({
   id,
   title: `标题-${id}`,
@@ -1509,6 +1527,53 @@ check(
   "落盘：审计文件匹配保留策略的文件名，过期会被自动清掉",
   FILE_PATTERNS.kbFeishuAudit.test(`kb-feishu-audit-${monthKey()}.jsonl`),
 );
+
+// 18. 回收站：id 加短 uuid 防撞车，只增不改，不可自动恢复
+const trash1 = await store.trash(storeEntry("s2"), "ou_smoke");
+check(
+  "回收站：id = 原 id + 短 uuid，便于人工看出这是哪一条",
+  new RegExp("^s2_[0-9a-f]{8}$").test(trash1),
+  trash1,
+);
+const trash2 = await store.trash(storeEntry("s2"), "ou_smoke");
+check("回收站：同一条被反复删除也不会撞 id", trash1 !== trash2);
+check("回收站：累计两条", (await store.trashCount()) === 2);
+const trashText = readFileSync(storeTrashPath, "utf8");
+check(
+  "回收站：文件里写明「不会自动恢复」和恢复办法，且带上删除者与内容",
+  trashText.includes("不会自动恢复") &&
+    trashText.includes("ou_smoke") &&
+    trashText.includes("标题-s2") &&
+    trashText.includes(trash1) &&
+    trashText.includes(trash2),
+);
+check(
+  "回收站：解析得回来（宽松解析，不会因为格式古怪就把菜单带崩）",
+  parseTrashFileText(trashText).length === 2 && parseTrashFileText("不是 yaml: [").length === 0,
+);
+// trash() 只负责归档，删补充层是调用方的下一步（服务端就是这么两步走的）
+const afterTrash = await store.load();
+await store.save({ ...afterTrash.file, entries: afterTrash.file.entries.filter((item) => item.id !== "s2") });
+check(
+  "回收站：归档 + 保存才是完整的删除，补充层里不再有它",
+  !(await store.load()).file.entries.some((item) => item.id === "s2"),
+);
+
+// 19. 管理员名单（含 * 通配）
+const aclWildcard = parseAdminIds("*", "oc_group");
+check("名单：* 且配了群 → 群内任何人可操作", aclWildcard.wildcard && aclWildcard.problem === "");
+const aclNoGroup = parseAdminIds("*", "");
+check(
+  "名单：* 但没配 LARK_FEEDBACK_CHAT_ID → 通配不生效并给出原因（fail closed）",
+  !aclNoGroup.wildcard && aclNoGroup.problem.includes("LARK_FEEDBACK_CHAT_ID"),
+);
+const aclIds = parseAdminIds(" ou_a , ou_b ,", "oc_group");
+check(
+  "名单：普通 open_id 列表逐个授权，空项忽略",
+  !aclIds.wildcard && aclIds.ids.size === 2 && aclIds.ids.has("ou_a") && aclIds.ids.has("ou_b"),
+);
+const aclMixed = parseAdminIds("ou_a,*", "oc_group");
+check("名单：混写时以 * 为准（并有 ou_a 也在名单里）", aclMixed.wildcard && aclMixed.ids.has("ou_a"));
 rmSync(storeRoot, { recursive: true, force: true });
 
 console.log(failed === 0 ? "\n全部通过 ✅" : `\n有 ${failed} 项失败 ❌`);

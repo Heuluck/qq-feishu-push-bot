@@ -33,12 +33,15 @@ const EntrySchema = EntryObjectSchema.refine(answerRequired, ANSWER_REQUIRED);
  *   - `added_by` 让人工把手写条目搬进 `kb.yaml`（转正）时知道该找谁确认。
  * zod 的 object 默认会丢掉未声明的键，所以这两个字段必须显式写进 schema 才活得下来。
  */
-const FeishuEntrySchema = EntryObjectSchema.extend({
+const FeishuEntryObjectSchema = EntryObjectSchema.extend({
   added_by: z.string().trim().min(1).optional(),
   added_at: z.string().trim().min(1).optional(),
-}).refine(answerRequired, ANSWER_REQUIRED);
+});
 
-export { FeishuEntrySchema };
+const FeishuEntrySchema = FeishuEntryObjectSchema.refine(answerRequired, ANSWER_REQUIRED);
+
+/** 未 refine 的对象 schema：回收站那类"再扩几个字段"的地方要拿它 `.extend()`。 */
+export { FeishuEntryObjectSchema, FeishuEntrySchema };
 
 export const ROUTE_LABEL: Record<"answer" | "forward" | "answer_and_forward", string> = {
   answer: "可直接回复",

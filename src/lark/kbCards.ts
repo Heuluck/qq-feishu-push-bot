@@ -45,6 +45,7 @@ export const OP = {
   toggle: "kb.toggle",
   submit: "kb.submit",
   del: "kb.del",
+  remove: "kb.remove",
   wizardNext: "kb.wizard.next",
   wizardBack: "kb.wizard.back",
 } as const;
@@ -160,12 +161,24 @@ function hr(): unknown {
   return { tag: "markdown", content: "---" };
 }
 
-function button(text: string, type: string, value: Record<string, unknown>): unknown {
+/**
+ * `confirm` 是飞书客户端自带的二次确认弹窗：确认之前**不会**发起回调，省一次往返，
+ * 也省得服务端自己维护"待确认"状态。注意 `title` 必填，缺了在老客户端上会点了没反应。
+ */
+function button(text: string, type: string, value: Record<string, unknown>, confirmText?: string): unknown {
   return {
     tag: "button",
     type,
     text: { tag: "plain_text", content: text },
     behaviors: [{ type: "callback", value }],
+    ...(confirmText !== undefined
+      ? {
+          confirm: {
+            title: { tag: "plain_text", content: text },
+            text: { tag: "plain_text", content: confirmText },
+          },
+        }
+      : {}),
   };
 }
 
@@ -425,7 +438,7 @@ export function buildResultCard(ok: boolean, title: string, lines: string[]): Ca
 }
 
 /** 查看补充条目：一条一个折叠面板，正文默认收起。 */
-export function buildEntryListCard(state: KbState, entries: FeishuKbEntry[]): Card {
+export function buildEntryListCard(state: KbState, entries: FeishuKbEntry[], sign: ActionSigner): Card {
   const elements: unknown[] = [md(stateLines(state)), hr()];
   if (entries.length === 0) {
     elements.push(md("飞书补充知识为空"));
@@ -437,9 +450,16 @@ export function buildEntryListCard(state: KbState, entries: FeishuKbEntry[]): Ca
       if (entry.answer) lines.push(`**答案**\n${truncate(entry.answer, budget)}`);
       if (entry.forward_hint) lines.push(`**转交说明**\n${truncate(entry.forward_hint, budget)}`);
       const added = entry.added_at ? `　·　${entry.added_at.slice(0, 16).replace("T", " ")}` : "";
-      elements.push(panel(`\`${entry.id}\`　${entry.title}${added}`, lines.map((line) => md(line))));
+      elements.push(
+        panel(`\`${entry.id}\`　${entry.title}${added}`, [
+          ...lines.map((line) => md(line)),
+          // 每条自带删除按钮：查看和删除在同一张卡上，不用记 id 再去找入口。
+          button("删除", "danger", sign({ op: OP.remove, id: entry.id }), "会移入回收站，且不会自动恢复"),
+        ]),
+      );
     }
   }
+  elements.push(md("删除会移入回收站（`kb/kb.feishu.trash.yaml`），程序不会自动恢复"));
   elements.push(md("转正：复制进 `kb/kb.yaml`，再从飞书补充知识删掉（id 不能两处同时存在）"));
   return card({ title: `飞书补充知识（${entries.length} 条）`, template: "blue" }, elements);
 }

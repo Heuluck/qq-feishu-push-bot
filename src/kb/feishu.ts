@@ -7,7 +7,7 @@
  * 写入策略：先留快照 → 临时文件 + rename 原子替换。任何一步失败都不会让磁盘上留下一份
  * 半截的 YAML（下次启动会直接拒绝加载）。
  */
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
@@ -30,6 +30,48 @@ const FILE_HEADER = `# 飞书补充知识库 —— 由飞书群里的管理菜�
 #
 # enabled: false 表示整层暂不注入 system prompt（条目仍然保留，随时可以再打开）。
 # added_by / added_at 是审计字段，不进提示词；added_at 还是「24 小时内才能删」的判据。`;
+
+/**
+ * 回收站文件头。
+ *
+ * 「不可自动恢复」是刻意的：这里只增不改，程序没有任何读回入口。要恢复就手工把某一条搬回
+ * `kb/kb.feishu.yaml`，并把 id 末尾的 `_<uuid>` 去掉。也正因为不会自动恢复，这个文件
+ * 不参与任何保留策略，攒多了自己删。
+ */
+const TRASH_HEADER = `# 飞书补充知识回收站 —— 卡片上删掉的条目落在这里，只增不改，程序不会自动恢复。
+#
+# 要恢复某一条：把它的内容原样搬回 kb/kb.feishu.yaml，并把 id 末尾的 _<uuid> 去掉。
+# 那个后缀只是为了同一条被反复删除时不在这个文件里撞车，去掉后才是能生效的原 id。
+#
+# 这个文件不参与自动清理，攒多了自己删。`;
+
+/** 回收站里的 id：原 id + 短 uuid。要的是"同一条反复删除也不撞车"，8 位十六进制足够。 */
+export function trashIdOf(originalId: string): string {
+  return `${originalId}_${randomBytes(4).toString("hex")}`;
+}
+
+/** 渲染回收站文件（只增不改，所以是整体重写，但仍然走原子替换）。 */
+export function renderTrashFileText(records: Record<string, unknown>[]): string {
+  return `${TRASH_HEADER}\n\n${stringifyYaml({ deleted: records }, { lineWidth: 0 })}`;
+}
+
+/**
+ * 解析回收站。**故意宽松**：这个文件是给人看/手工改的，读的时候不该因为某条格式古怪就抛错
+ * 把整个管理菜单带崩；程序本来也不消费它的内容。
+ */
+export function parseTrashFileText(raw: string): Record<string, unknown>[] {
+  let doc: unknown;
+  try {
+    doc = parseYaml(raw);
+  } catch {
+    // 手工改坏了 YAML 也不该抛：这里只是归档，没人靠它跑业务。
+    return [];
+  }
+  if (typeof doc !== "object" || doc === null) return [];
+  const list = (doc as Record<string, unknown>)["deleted"];
+  if (!Array.isArray(list)) return [];
+  return list.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null);
+}
 
 export interface FeishuLayerFile {
   enabled: boolean;
@@ -174,18 +216,36 @@ export function checkDeletable(
  * 不做校验——「这份内容能不能用」是 `compileKnowledgeBase` 的事，
  * 调用方必须先试编译通过再调 `save`，这样坏内容永远不会落到磁盘上。
  */
+export interface FeishuKbStorePaths {
+  /** 可编辑的飞书补充层。 */
+  layer: string;
+  /** 删除后归档到的回收站。 */
+  trash: string;
+  /** data/ 目录：快照与审计落在这里。 */
+  dataDir: string;
+}
+
 export class FeishuKbStore {
-  constructor(
-    private readonly path: string,
-    private readonly dataDir: string,
-  ) {}
+  constructor(private readonly paths: FeishuKbStorePaths) {}
 
   get filePath(): string {
-    return this.path;
+    return this.paths.layer;
+  }
+
+  private get path(): string {
+    return this.paths.layer;
+  }
+
+  private get dataDir(): string {
+    return this.paths.dataDir;
+  }
+
+  private get trashPath(): string {
+    return this.paths.trash;
   }
 
   private get snapshotDir(): string {
-    return join(this.dataDir, "kb-feishu-snapshots");
+    return join(this.paths.dataDir, "kb-feishu-snapshots");
   }
 
   /** 读当前内容；文件不存在时返回一个空的启用态（首次运行的正常情况）。 */
@@ -245,6 +305,46 @@ export class FeishuKbStore {
       return names.slice(0, limit);
     } catch {
       return [];
+    }
+  }
+
+  /**
+   * 把一条移进回收站，返回它在回收站里的新 id。
+   *
+   * **先写回收站、再改补充层**：反过来的话，中间挂掉就会丢掉这条内容。
+   * 写回收站失败会直接把错误抛给调用方，宁可不删也不能删丢了。
+   */
+  async trash(entry: FeishuKbEntry, actor: string): Promise<string> {
+    let records: Record<string, unknown>[] = [];
+    try {
+      records = parseTrashFileText(await readFile(this.trashPath, "utf8"));
+    } catch {
+      // 还没有回收站文件，属于正常情况。
+      records = [];
+    }
+    const id = trashIdOf(entry.id);
+    records.push({
+      id,
+      deleted_at: new Date().toISOString(),
+      deleted_by: actor,
+      title: entry.title,
+      keywords: entry.keywords,
+      route: entry.route,
+      ...(entry.answer !== undefined ? { answer: entry.answer } : {}),
+      ...(entry.forward_hint !== undefined ? { forward_hint: entry.forward_hint } : {}),
+      ...(entry.added_by !== undefined ? { added_by: entry.added_by } : {}),
+      ...(entry.added_at !== undefined ? { added_at: entry.added_at } : {}),
+    });
+    await atomicWrite(this.trashPath, renderTrashFileText(records));
+    return id;
+  }
+
+  /** 回收站里有多少条（给状态卡片用）。 */
+  async trashCount(): Promise<number> {
+    try {
+      return parseTrashFileText(await readFile(this.trashPath, "utf8")).length;
+    } catch {
+      return 0;
     }
   }
 
