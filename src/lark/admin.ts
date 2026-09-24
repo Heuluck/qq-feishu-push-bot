@@ -5,9 +5,9 @@
  * ```
  * 群里 @机器人
  *   └─ 主菜单卡片（平铺在主消息流，成为话题的根）
- *       ├─ ➕ 新增条目   → 表单卡片（进话题）→ 提交 → 「已新增」卡片（进话题，带删除按钮）
- *       ├─ 📋 查看补充条目 → 列表卡片（进话题，条目折叠）
- *       └─ 🔁 切换注入    → 结果卡片（进话题）
+ *       ├─ 新增条目     → 两步向导（进话题）→ 「已新增」卡片（带删除按钮）
+ *       ├─ 查看补充条目 → 列表卡片（进话题，条目折叠）
+ *       └─ 切换注入     → 结果卡片（进话题）
  * ```
  * 卡片之间的父子关系靠 `reply_in_thread: true` 建立：被回复的消息成为话题根，之后所有
  * 回复自动落回同一话题，所以**这一层不需要保存任何会话状态**。
@@ -78,6 +78,11 @@ function toast(type: "success" | "error" | "info" | "warning", content: string):
 
 function toastWithCard(type: "success" | "error" | "info" | "warning", content: string, card: Card): CallbackResponse {
   return { toast: { type, content }, card: { type: "raw", data: card } };
+}
+
+/** 只换卡片、不弹 toast。卡片本身就是反馈的场合用它（向导翻页、原地改状态）。 */
+function cardOnly(card: Card): CallbackResponse {
+  return { card: { type: "raw", data: card } };
 }
 
 function errorText(err: unknown): string {
@@ -271,10 +276,10 @@ export class LarkKbAdmin {
     }
   }
 
-  /** ➕ 新增条目：不碰菜单卡片，另发一张向导卡片（第一步）进话题。 */
+  /** 新增条目：不碰菜单卡片，另发一张向导卡片（第一步）进话题。 */
   private async onAdd(messageId: string): Promise<CallbackResponse> {
     await this.replyCard(messageId, buildStep1Card(this.sign, EMPTY_DRAFT), { inThread: true });
-    return toast("info", "表单已发到下方话题里，填完点「下一步」");
+    return toast("info", "见下方话题。");
   }
 
   /**
@@ -288,7 +293,7 @@ export class LarkKbAdmin {
     const draft = mergeDraft(draftFromValue(payload), form);
     const problem = this.checkStep1(draft);
     if (problem !== "") return toast("error", problem);
-    return toastWithCard("info", "第二步：填这一项就够了", buildStep2Card(draft, this.sign));
+    return cardOnly(buildStep2Card(draft, this.sign));
   }
 
   /**
@@ -299,17 +304,17 @@ export class LarkKbAdmin {
    */
   private async onWizardBack(payload: Record<string, unknown>, form: Record<string, unknown>): Promise<CallbackResponse> {
     const draft = mergeDraft(draftFromValue(payload), form);
-    return toastWithCard("info", "回到第一步", buildStep1Card(this.sign, draft));
+    return cardOnly(buildStep1Card(this.sign, draft));
   }
 
-  /** 📋 查看补充条目。 */
+  /** 查看补充条目。 */
   private async onList(messageId: string): Promise<CallbackResponse> {
     const { file } = await this.store.load();
     await this.replyCard(messageId, buildEntryListCard(this.state(), file.entries), { inThread: true });
-    return toast("info", "补充条目已发到下方话题里");
+    return toast("info", "见下方话题。");
   }
 
-  /** 🔁 切换「飞书补充知识」注入开关。按**当前状态取反**，不信任卡片上烘焙的旧状态。 */
+  /** 切换「飞书补充知识」注入开关。按**当前状态取反**，不信任卡片上烘焙的旧状态。 */
   private async onToggle(messageId: string): Promise<CallbackResponse> {
     const { present, file } = await this.store.load();
     const wanted = !file.enabled;
@@ -323,15 +328,10 @@ export class LarkKbAdmin {
     await this.replyCard(messageId, buildToggleResultCard(state, this.sign), { inThread: true });
     // 菜单上的状态行也得跟着变，否则它一直显示旧状态。
     void this.refreshMenu();
-    return toast(
-      "success",
-      wanted
-        ? `补充知识已启用（${state.feishuCount} 条）`
-        : "补充知识已停用，正式知识库不受影响",
-    );
+    return toast("success", wanted ? `已启用，${state.feishuCount} 条` : "已停用。");
   }
 
-  /** 🗑 删除刚添加的那一条：24 小时窗口 + id 严格相等 + 签名三重校验。 */
+  /** 删除刚添加的那一条：24 小时窗口 + id 严格相等 + 签名三重校验。 */
   private async onDelete(openId: string, payload: Record<string, unknown>, messageId: string): Promise<CallbackResponse> {
     const id = typeof payload["id"] === "string" ? payload["id"] : "";
     const cardAddedAt = typeof payload["added_at"] === "string" ? payload["added_at"] : "";
@@ -358,10 +358,7 @@ export class LarkKbAdmin {
     void this.refreshMenu();
     void this.replyCard(
       messageId,
-      buildResultCard(true, `已删除：${entry.title}`, [
-        `**id**　\`${entry.id}\``,
-        "已从飞书补充知识库移除，下一次问答不再包含它。",
-      ]),
+      buildResultCard(true, `已删除：${entry.title}`, [`**id**　\`${entry.id}\``, "下一次问答不再包含它。"]),
       { inThread: true },
     );
     return toastWithCard("success", `已删除「${entry.title}」`, buildDeletedCard(entry));
@@ -398,7 +395,7 @@ export class LarkKbAdmin {
     const parsed = FeishuEntrySchema.safeParse(candidate);
     if (!parsed.success) {
       const issue = parsed.error.issues[0];
-      return toast("error", `表单有问题：${issue ? issue.message : "校验失败"}`);
+      return toast("error", `校验失败：${issue ? issue.message : "未知原因"}`);
     }
     const entry = parsed.data;
 

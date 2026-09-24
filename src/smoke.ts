@@ -1387,7 +1387,7 @@ for (const [route, expected] of [
     collectNames(built, "input").join(",") === expected,
   );
   check(
-    `向导第二步（${route}）：没有任何前端必填（否则「↩️ 上一步」会被『有必填项未填写』拦住，带不走已写内容）`,
+    `向导第二步（${route}）：没有任何前端必填（否则「上一步」会被『有必填项未填写』拦住，带不走已写内容）`,
     !JSON.stringify(built).includes('"required":true'),
   );
   check(
@@ -1456,8 +1456,8 @@ check(
     JSON.stringify(buildEntryListCard(state, delEntries)).includes('"expanded":false'),
 );
 check(
-  "查看卡片：空库时给一句人话，不给空白卡片",
-  JSON.stringify(buildEntryListCard({ ...state, feishuCount: 0 }, [])).includes("现在是空的"),
+  "查看卡片：空库时给一句话，不给空白卡片",
+  JSON.stringify(buildEntryListCard({ ...state, feishuCount: 0 }, [])).includes("为空"),
 );
 check(
   "切换卡片：标题随目标状态变化",

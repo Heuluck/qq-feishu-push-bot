@@ -16,8 +16,8 @@
  *   3. 当前这一步表单里**没有**的字段（例如第二步不显示 id/标题），由按钮的签名 `value`
  *      带着走 —— 全程无服务端状态，来回切多少次都不会错。
  *
- * ⚠️ 因此第二步的输入框**故意不设 `required`**：`required` 是前端拦截，
- * 一旦设上，用户想点「↩️ 上一步」会先被「有必填项未填写」挡住、带不走已经写好的内容。
+ * 注意：因此第二步的输入框**故意不设 `required`**。`required` 是前端拦截，一旦设上，
+ * 用户点「上一步」会先被「有必填项未填写」挡住、带不走已经写好的内容。
  * 第二步的校验改在服务端做（错了只弹 toast、**不更新卡片**，用户填的字原地保留）。
  *
  * 为什么统一用 2.0：表单容器、输入框多行、下拉选择这些都要 2.0；而且飞书明确
@@ -255,9 +255,9 @@ function panel(title: string, elements: unknown[], expanded = false): unknown {
 function stateLines(state: KbState): string {
   const feishu = state.feishuPresent
     ? state.feishuEnabled
-      ? `🟢 已启用，${state.feishuCount} 条（fs-${state.feishuVersion}）`
-      : `⚪️ 已停用，${state.feishuCount} 条仍在文件里（fs-${state.feishuVersion}）`
-    : "（还没有补充条目）";
+      ? `已启用，${state.feishuCount} 条（fs-${state.feishuVersion}）`
+      : `已停用，${state.feishuCount} 条、仍在文件里（fs-${state.feishuVersion}）`
+    : "无";
   return [
     `**正式知识库**　kb-${state.baseVersion}，${state.baseCount} 条`,
     `**飞书补充**　${feishu}`,
@@ -269,27 +269,24 @@ function stateLines(state: KbState): string {
 
 /** 主菜单。这个卡片留在群的主消息流里，别的卡片都收进它下面的话题。 */
 export function buildMenuCard(state: KbState, sign: ActionSigner): Card {
-  return card({ title: "🤖 知识库管理", template: "blue" }, [
+  return card({ title: "知识库管理", template: "blue" }, [
     md(stateLines(state)),
     hr(),
     buttons([
-      button("➕ 新增条目", "primary", sign({ op: OP.add })),
-      button("📋 查看补充条目", "default", sign({ op: OP.list })),
+      button("新增条目", "primary", sign({ op: OP.add })),
+      button("查看补充条目", "default", sign({ op: OP.list })),
       // 标签写成中性的「切换」而不是「启用/停用」：卡片一旦发出就改不了文字，
       // 而服务端是按当前状态取反，标签写成状态词迟早会和实际状态对不上。
-      button("🔁 切换「飞书补充」注入", "default", sign({ op: OP.toggle })),
+      button("切换飞书补充注入", "default", sign({ op: OP.toggle })),
     ]),
-    md(
-      "点上面的按钮后，新的卡片会出现在**本条消息的话题**里，不会刷群。" +
-        "飞书补充知识是临时的，想长期保留请把它搬进 `kb/kb.yaml` 转正。",
-    ),
+    md("卡片收在本条消息的话题里。飞书补充是临时的，长期保留要搬进 `kb/kb.yaml`。"),
   ]);
 }
 
 /** 第一步：基本信息 + 处理方式。点「下一步」时才决定第二步要填哪个框。 */
 export function buildStep1Card(sign: ActionSigner, draft: WizardDraft): Card {
-  return card({ title: "➕ 新增一条补充知识（1/2）", template: "turquoise" }, [
-    md("先填基本信息、选好处理方式。点「下一步」后**只会显示这次真正要填的那一个**输入框。"),
+  return card({ title: "新增补充知识 1/2", template: "turquoise" }, [
+    md("下一步只填所选处理方式对应的那一项。"),
     {
       tag: "form",
       name: "kb_step1",
@@ -320,7 +317,7 @@ export function buildStep1Card(sign: ActionSigner, draft: WizardDraft): Card {
       ],
     },
     md(
-      `限制：id ≤ ${MAX_ID_CHARS} 字（只能用字母、数字、下划线、短横线），标题 ≤ ${MAX_TITLE_CHARS} 字，` +
+      `id 限字母、数字、下划线、短横线，≤ ${MAX_ID_CHARS} 字；标题 ≤ ${MAX_TITLE_CHARS} 字；` +
         `关键词合计 ≤ ${MAX_KEYWORDS_CHARS} 字。`,
     ),
   ]);
@@ -335,26 +332,26 @@ export function buildStep2Card(draft: WizardDraft, sign: ActionSigner): Card {
   const fields: unknown[] = [];
   if (draft.route === "answer" || draft.route === "answer_and_forward") {
     fields.push(
-      inputField("answer", "答案（给同学看的话）", {
+      inputField("answer", "答案（发给同学的）", {
         multiline: true,
         max: MAX_ANSWER_CHARS,
-        placeholder: "直接回复的内容，不要写内部信息",
+        placeholder: "不要写内部信息",
         value: draft.answer,
       }),
     );
   }
   if (draft.route === "forward" || draft.route === "answer_and_forward") {
     fields.push(
-      inputField("forward_hint", "转交说明（处理人员需要同学提供什么材料）", {
+      inputField("forward_hint", "转交说明（给处理人员）", {
         multiline: true,
         max: MAX_FORWARD_HINT_CHARS,
-        placeholder: "如：需要同学提供学号、报错截图",
+        placeholder: "如：学号、报错截图",
         value: draft.forward_hint,
       }),
     );
   }
 
-  return card({ title: "➕ 新增一条补充知识（2/2）", template: "turquoise" }, [
+  return card({ title: "新增补充知识 2/2", template: "turquoise" }, [
     md(
       [
         `**id**　\`${draft.id}\``,
@@ -363,15 +360,15 @@ export function buildStep2Card(draft: WizardDraft, sign: ActionSigner): Card {
         `**处理方式**　${routeLabel(draft.route)}`,
       ].join("\n"),
     ),
-    md("以上信息已经记下，要改点「↩️ 上一步」，**内容会原样带回去**。"),
+    md("要改点「上一步」，已填内容会带回去。"),
     {
       tag: "form",
       name: "kb_step2",
       elements: [
         ...fields,
         buttons([
-          submitButton("✅ 提交", "primary_filled", "kb_submit", draftValue(sign, OP.submit, draft)),
-          submitButton("↩️ 上一步", "default", "kb_back", draftValue(sign, OP.wizardBack, draft)),
+          submitButton("提交", "primary_filled", "kb_submit", draftValue(sign, OP.submit, draft)),
+          submitButton("上一步", "default", "kb_back", draftValue(sign, OP.wizardBack, draft)),
         ]),
       ],
     },
@@ -380,9 +377,9 @@ export function buildStep2Card(draft: WizardDraft, sign: ActionSigner): Card {
 
 /** 表单提交成功后**原地**替换掉那张向导卡片：去掉输入框，防止重复提交。 */
 export function buildSubmittedCard(entry: FeishuKbEntry): Card {
-  return card({ title: "✅ 已提交", template: "green" }, [
-    md(`**${entry.title}**（id \`${entry.id}\`）已经写入飞书补充知识库，下一次问答就会带上它。`),
-    md("结果卡片在该消息的话题里，24 小时内可以点里面的「删除这一条」撤销。"),
+  return card({ title: "已提交", template: "green" }, [
+    md(`**${entry.title}**（id \`${entry.id}\`）已写入飞书补充知识库，下一次问答生效。`),
+    md("结果卡片在话题里，24 小时内可删除。"),
   ]);
 }
 
@@ -395,24 +392,24 @@ export function buildAddedCard(entry: FeishuKbEntry, sign: ActionSigner): Card {
   if (entry.forward_hint) elements.push(md(`**转交说明**\n${truncate(entry.forward_hint, 400)}`));
   elements.push(hr());
   elements.push(
-    button("🗑 删除这一条", "danger", sign({ op: OP.del, id: entry.id, added_at: entry.added_at ?? "" })),
+    button("删除这一条", "danger", sign({ op: OP.del, id: entry.id, added_at: entry.added_at ?? "" })),
   );
-  elements.push(md("删除按钮**只在 24 小时内有效**，且只会删掉 id 完全相同的这一条。"));
-  return card({ title: `✅ 已新增：${entry.title}`, template: "green" }, elements);
+  elements.push(md("24 小时内可删；只删 id 相同的那一条。"));
+  return card({ title: `已新增：${entry.title}`, template: "green" }, elements);
 }
 
 /** 删除成功后**原地**替换那张「已新增」卡片：按钮消失，防止重复点。 */
 export function buildDeletedCard(entry: FeishuKbEntry): Card {
-  return card({ title: "🗑 已删除", template: "grey" }, [
-    md(`**${entry.title}**（id \`${entry.id}\`）已从飞书补充知识库移除，不再注入提示词。`),
+  return card({ title: "已删除", template: "grey" }, [
+    md(`**${entry.title}**（id \`${entry.id}\`）已从飞书补充知识库移除。`),
   ]);
 }
 
 /** 通用结果卡片（成功/失败都走它）。 */
 export function buildResultCard(ok: boolean, title: string, lines: string[]): Card {
   return card(
-    { title: `${ok ? "✅" : "⚠️"} ${title}`, template: ok ? "green" : "orange" },
-    lines.length > 0 ? lines.map((line) => md(line)) : [md("（没有更多信息）")],
+    { title, template: ok ? "green" : "orange" },
+    lines.length > 0 ? lines.map((line) => md(line)) : [md("没有更多信息。")],
   );
 }
 
@@ -420,7 +417,7 @@ export function buildResultCard(ok: boolean, title: string, lines: string[]): Ca
 export function buildEntryListCard(state: KbState, entries: FeishuKbEntry[]): Card {
   const elements: unknown[] = [md(stateLines(state)), hr()];
   if (entries.length === 0) {
-    elements.push(md("飞书补充知识库现在是空的。"));
+    elements.push(md("飞书补充知识库为空。"));
   } else {
     // 卡片消息有 30KB 上限，条目多时把答案截短，避免整张卡发不出去。
     const budget = entries.length > 20 ? 120 : 300;
@@ -432,25 +429,21 @@ export function buildEntryListCard(state: KbState, entries: FeishuKbEntry[]): Ca
       elements.push(panel(`\`${entry.id}\`　${entry.title}${added}`, lines.map((line) => md(line))));
     }
   }
-  elements.push(md("要转正：把条目复制进 `kb/kb.yaml` 再从飞书层删掉（id 不能两处同时存在）。"));
-  return card({ title: `📋 飞书补充条目（${entries.length} 条）`, template: "blue" }, elements);
+  elements.push(md("转正：复制进 `kb/kb.yaml`，再从飞书层删掉（id 不能两处同时存在）。"));
+  return card({ title: `飞书补充条目（${entries.length} 条）`, template: "blue" }, elements);
 }
 
 /** 切换注入开关后的结果卡片，带一个「切回去」的按钮。 */
 export function buildToggleResultCard(state: KbState, sign: ActionSigner): Card {
   const on = state.feishuEnabled;
   return card(
-    { title: on ? "🟢 补充知识已启用" : "⚪️ 补充知识已停用", template: on ? "green" : "grey" },
+    { title: on ? "补充知识已启用" : "补充知识已停用", template: on ? "green" : "grey" },
     [
       md(stateLines(state)),
-      md(
-        on
-          ? "飞书补充条目已经进入 system prompt，下一次问答就带上它们了。"
-          : "飞书补充条目仍然留在文件里，只是不再注入提示词；正式知识库不受影响。",
-      ),
+      md(on ? "已进入 system prompt，下一次问答生效。" : "条目仍在文件里，只是不再注入；正式知识库不受影响。"),
       buttons([
-        button("🔁 切换", "default", sign({ op: OP.toggle })),
-        button("📋 查看补充条目", "default", sign({ op: OP.list })),
+        button("切换", "default", sign({ op: OP.toggle })),
+        button("查看补充条目", "default", sign({ op: OP.list })),
       ]),
     ],
   );
