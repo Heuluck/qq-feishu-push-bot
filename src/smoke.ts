@@ -20,13 +20,19 @@ import {
 } from "./kb/feishu.js";
 import type { FeishuLayerFile } from "./kb/feishu.js";
 import {
+  EMPTY_DRAFT,
+  OP,
   buildAddedCard,
   buildEntryListCard,
-  buildFormCard,
   buildMenuCard,
+  buildStep1Card,
+  buildStep2Card,
   buildToggleResultCard,
+  draftFromValue,
+  draftValue,
+  mergeDraft,
 } from "./lark/kbCards.js";
-import type { Card, KbState } from "./lark/kbCards.js";
+import type { Card, KbState, WizardDraft } from "./lark/kbCards.js";
 import { REPLY_HINT, buildMessages } from "./llm/messages.js";
 import { EXPOSED_TOOLS, FORWARD_FEEDBACK_TOOL, ForwardFeedbackArgs, SEND_FOLLOWUP_TOOL, SendFollowupArgs, createTurnTools } from "./llm/tools.js";
 import { extractTextToolCalls, runTextToolCalls } from "./llm/toolmarkup.js";
@@ -1284,6 +1290,7 @@ const collectNames = (card: Card, tag: string): string[] => {
   return out;
 };
 // smoke 里用恒等签名：这里只验结构，签名本身在第 14 段单独验。
+const identitySign = (payload: Record<string, unknown>): Record<string, unknown> => payload;
 const state: KbState = {
   baseVersion: "aaaa1111",
   baseCount: 20,
@@ -1307,23 +1314,130 @@ check(
   buildMenuCard(state, (payload) => payload)["schema"] === "2.0" &&
     Array.isArray((buildMenuCard(state, (payload) => payload)["body"] as Record<string, unknown>)["elements"]),
 );
-const formCard = buildFormCard((payload) => payload);
-check(
-  "表单卡片：字段名与 kb.feishu.yaml 的键一一对应",
-  collectNames(formCard, "input").join(",") === "id,title,keywords,answer,forward_hint" &&
-    collectNames(formCard, "select_static").join(",") === "route",
-);
-check(
-  "表单卡片：提交按钮带回 kb.submit，且挂在表单容器里",
-  collectActions(formCard).some((value) => value["op"] === "kb.submit") &&
-    collectNames(formCard, "form").length === 1,
-);
-check(
-  "表单卡片：必填字段真的标了 required（前端就拦住，省一次往返）",
-  (((formCard["body"] as Record<string, unknown>)["elements"] as Record<string, unknown>[]).find(
+// 向导：两步之间靠「提交按钮带回 form_value + 服务端用 default_value 回填」搬值。
+const formElements = (built: Card): Record<string, unknown>[] =>
+  (((built["body"] as Record<string, unknown>)["elements"] as Record<string, unknown>[]).find(
     (element) => element["tag"] === "form",
-  )?.["elements"] as Record<string, unknown>[]).filter((element) => element["required"] === true).length === 4,
+  )?.["elements"] as Record<string, unknown>[]) ?? [];
+
+/** 表单里的提交按钮。按钮被 column_set 包着，所以要递归找。 */
+const submitButtons = (built: Card): Record<string, unknown>[] => {
+  const out: Record<string, unknown>[] = [];
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    if (typeof node !== "object" || node === null) return;
+    const record = node as Record<string, unknown>;
+    if (record["form_action_type"] === "submit") out.push(record);
+    for (const value of Object.values(record)) walk(value);
+  };
+  walk(built);
+  return out;
+};
+
+const step1 = buildStep1Card(identitySign, EMPTY_DRAFT);
+check(
+  "向导第一步：字段名与 kb.feishu.yaml 的键一一对应",
+  collectNames(step1, "input").join(",") === "id,title,keywords" &&
+    collectNames(step1, "select_static").join(",") === "route",
 );
+check(
+  "向导第一步：「下一步」是表单提交按钮（只有提交按钮才带回 form_value）",
+  submitButtons(step1).length === 1 &&
+    submitButtons(step1)[0]?.["name"] === "kb_next" &&
+    collectActions(step1).some((value) => value["op"] === "kb.wizard.next"),
+);
+check(
+  "向导第一步：四个字段都标了 required（前端就拦住，省一次往返）",
+  formElements(step1).filter((element) => element["required"] === true).length === 4,
+);
+check("向导第一步：空草稿不回填任何 default_value", !JSON.stringify(step1).includes("default_value"));
+
+const carried: WizardDraft = {
+  id: "feishu-a",
+  title: "标题",
+  keywords: "甲,乙",
+  route: "forward",
+  answer: "在第二步敲了一半的答案",
+  forward_hint: "",
+};
+const step1Back = buildStep1Card(identitySign, carried);
+check(
+  "向导回退：第一步的输入框被 default_value 回填、下拉恢复选中",
+  JSON.stringify(step1Back).includes('"default_value":"feishu-a"') &&
+    JSON.stringify(step1Back).includes('"initial_option":"需转交人工"'),
+);
+check(
+  "向导第一步：「下一步」的按钮值里带着草稿（第二步敲的内容能活过「上一步→下一步」）",
+  collectActions(step1Back).some(
+    (value) => value["op"] === "kb.wizard.next" && value["answer"] === "在第二步敲了一半的答案",
+  ),
+);
+
+for (const [route, expected] of [
+  ["answer", "answer"],
+  ["forward", "forward_hint"],
+  ["answer_and_forward", "answer,forward_hint"],
+] as const) {
+  const built = buildStep2Card({ ...EMPTY_DRAFT, id: "feishu-a", title: "标题", keywords: "甲", route }, identitySign);
+  check(
+    `向导第二步（${route}）：只出现该填的输入框`,
+    collectNames(built, "input").join(",") === expected,
+  );
+  check(
+    `向导第二步（${route}）：没有任何前端必填（否则「↩️ 上一步」会被『有必填项未填写』拦住，带不走已写内容）`,
+    !JSON.stringify(built).includes('"required":true'),
+  );
+  check(
+    `向导第二步（${route}）：提交与上一步都是提交按钮，且各自带回对应的 op`,
+    submitButtons(built).length === 2 &&
+      submitButtons(built).map((element) => element["name"]).join(",") === "kb_submit,kb_back" &&
+      collectActions(built).some((value) => value["op"] === "kb.submit") &&
+      collectActions(built).some((value) => value["op"] === "kb.wizard.back"),
+  );
+  check(
+    `向导第二步（${route}）：按钮值里带着第一步的字段（第二步的表单里没有它们）`,
+    collectActions(built).every(
+      (value) => value["id"] === "feishu-a" && value["title"] === "标题" && value["keywords"] === "甲" && value["route"] === route,
+    ),
+  );
+  check(
+    `向导第二步（${route}）：第一步的内容用纯字符串展示出来了`,
+    JSON.stringify(built).includes("**标题**　标题") && JSON.stringify(built).includes("**处理方式**"),
+  );
+}
+
+// 草稿在按钮值里往返 + 表单值合并的语义
+const draftPayload = draftFromValue(draftValue(identitySign, OP.wizardNext, carried));
+check(
+  "向导草稿：写进按钮值再读回来逐字段不变",
+  JSON.stringify(draftPayload) === JSON.stringify(carried),
+  JSON.stringify(draftPayload),
+);
+const formSays = mergeDraft(carried, { answer: "用户后来改的", route: "answer" });
+check(
+  "向导草稿：表单里有的字段以表单为准",
+  formSays.answer === "用户后来改的" && formSays.route === "answer",
+);
+check(
+  "向导草稿：表单里没有的字段原样保留（这正是「上一步」能带回内容的原因）",
+  formSays.id === "feishu-a" && formSays.title === "标题" && formSays.keywords === "甲,乙",
+);
+check(
+  "向导草稿：表单里的非字符串值不会被当成内容",
+  mergeDraft(carried, { answer: 42, id: null }).answer === carried.answer &&
+    mergeDraft(carried, { answer: 42, id: null }).id === carried.id,
+);
+check(
+  "向导草稿：签名覆盖到全部六个字段（改任何一个都会验签失败）",
+  verifyActionValue(SECRET, {
+    ...draftValue((payload) => signActionValue(SECRET, payload), OP.submit, carried),
+    answer: "被改过",
+  }).ok === false,
+);
+
 const addedAt = "2026-01-02T03:04:05.000Z";
 const addedActions = collectActions(
   buildAddedCard({ ...delEntries[0]!, added_at: addedAt }, (payload) => payload),

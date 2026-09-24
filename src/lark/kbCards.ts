@@ -1,8 +1,24 @@
 /**
  * 飞书知识库管理卡片（卡片 JSON 2.0）。
  *
- * 全是纯函数（入参 → 卡片 JSON），可以在 `npm run smoke` 里离线检查结构，
+ * 全是纯函数（入参 → 卡片 JSON），可以在 `npm run smoke` 里离线检查结构；
  * 签名由调用方通过 `sign` 传进来，本模块不碰机密。
+ *
+ * ## 两步向导：值是怎么过河的
+ *
+ * 飞书卡片是**静态一次渲染**的，没有条件显隐，也没法让客户端自己在两步之间留着输入。
+ * 所以「上一步填的东西还在」是这么做到的：
+ *   1. 每一步的「下一步 / 提交 / 上一步」都是**表单容器里的提交按钮**
+ *      （`form_action_type: "submit"`）。只有提交按钮的回调才带 `action.form_value`，
+ *      放在表单外面的按钮只会回传发卡时写死的 `value`，拿不到用户敲进去的字。
+ *   2. 服务端拿到 `form_value` 后，把整份草稿重新写进下一张卡片：能填的字段用
+ *      `input.default_value` 回填，下拉用 `select_static.initial_option` 回填。
+ *   3. 当前这一步表单里**没有**的字段（例如第二步不显示 id/标题），由按钮的签名 `value`
+ *      带着走 —— 全程无服务端状态，来回切多少次都不会错。
+ *
+ * ⚠️ 因此第二步的输入框**故意不设 `required`**：`required` 是前端拦截，
+ * 一旦设上，用户想点「↩️ 上一步」会先被「有必填项未填写」挡住、带不走已经写好的内容。
+ * 第二步的校验改在服务端做（错了只弹 toast、**不更新卡片**，用户填的字原地保留）。
  *
  * 为什么统一用 2.0：表单容器、输入框多行、下拉选择这些都要 2.0；而且飞书明确
  * 「JSON 2.0 的卡片不能更新成 1.0」（错误码 200830），一张卡片从生到死必须同版本。
@@ -29,7 +45,85 @@ export const OP = {
   toggle: "kb.toggle",
   submit: "kb.submit",
   del: "kb.del",
+  wizardNext: "kb.wizard.next",
+  wizardBack: "kb.wizard.back",
 } as const;
+
+export const ROUTES = ["answer", "forward", "answer_and_forward"] as const;
+export type Route = (typeof ROUTES)[number];
+
+export function isRoute(value: string): value is Route {
+  return (ROUTES as readonly string[]).includes(value);
+}
+
+function routeLabel(route: string): string {
+  return isRoute(route) ? ROUTE_LABEL[route] : "（未选择）";
+}
+
+// ── 向导草稿：在几张卡片之间传递的那份「填了一半的条目」 ──────────────────────
+
+/**
+ * 全部字段都是**用户敲进去的原文**，空串表示还没填。
+ * 不做 trim、不做拆分——原样来回搬，用户看到的就是自己写的。
+ */
+export interface WizardDraft {
+  id: string;
+  title: string;
+  keywords: string;
+  route: string;
+  answer: string;
+  forward_hint: string;
+}
+
+export const EMPTY_DRAFT: WizardDraft = {
+  id: "",
+  title: "",
+  keywords: "",
+  route: "",
+  answer: "",
+  forward_hint: "",
+};
+
+const DRAFT_KEYS: (keyof WizardDraft)[] = ["id", "title", "keywords", "route", "answer", "forward_hint"];
+
+/**
+ * 把草稿塞进按钮的回传值，并签名。
+ *
+ * **展平成顶层键**而不是塞成一个嵌套对象：`signActionValue` 只对顶层键排序做规范化，
+ * 嵌套对象内部的键序依赖 JSON 往返是否原样保留——展平以后顺序完全确定，验签不会漂。
+ */
+export function draftValue(sign: ActionSigner, op: string, draft: WizardDraft): Record<string, unknown> {
+  const payload: Record<string, unknown> = { op };
+  for (const key of DRAFT_KEYS) payload[key] = draft[key];
+  return sign(payload);
+}
+
+/** 从按钮回传值里还原草稿（内部用；调用方拿到的是签名校验后的 payload）。 */
+export function draftFromValue(payload: Record<string, unknown>): WizardDraft {
+  const draft: WizardDraft = { ...EMPTY_DRAFT };
+  for (const key of DRAFT_KEYS) {
+    const value = payload[key];
+    if (typeof value === "string") draft[key] = value;
+  }
+  return draft;
+}
+
+/**
+ * 把刚提交上来的表单值合并进草稿。
+ *
+ * 只有**表单里真实存在的字段**才覆盖：第一步的表单没有 answer/forward_hint，所以从第二步
+ * 退回第一步时，用户刚敲的那段答案会跟在按钮的签名值里活下来，再点「下一步」又回到眼前。
+ */
+export function mergeDraft(draft: WizardDraft, form: Record<string, unknown>): WizardDraft {
+  const next: WizardDraft = { ...draft };
+  for (const key of DRAFT_KEYS) {
+    const value = form[key];
+    if (typeof value === "string") next[key] = value;
+  }
+  return next;
+}
+
+// ── 卡片零件 ────────────────────────────────────────────────────────────────
 
 export interface KbState {
   baseVersion: string;
@@ -59,8 +153,8 @@ function md(content: string): unknown {
  * 分隔线。
  *
  * 故意用 markdown 的 thematic break 而不是 `{"tag": "hr"}` 组件：2.0 结构
- * 「传入不支持的属性将报错」（1.0 只是忽略），而 `hr` 组件在 2.0 的组件文档里没被明确列为可用，
- * 而 markdown 的 `---` 是标准语法、一定有。少一个需要赌的组件。
+ * 「传入不支持的属性将报错」（1.0 只是忽略），`hr` 虽然确实在 2.0 组件表里，但 markdown
+ * 的 `---` 是标准语法、一定有，少一个需要赌的组件。
  */
 function hr(): unknown {
   return { tag: "markdown", content: "---" };
@@ -71,6 +165,18 @@ function button(text: string, type: string, value: Record<string, unknown>): unk
     tag: "button",
     type,
     text: { tag: "plain_text", content: text },
+    behaviors: [{ type: "callback", value }],
+  };
+}
+
+/** 表单容器里的提交按钮。必须有 `name`，否则飞书报 200530（表单项标识为空）。 */
+function submitButton(text: string, type: string, name: string, value: Record<string, unknown>): unknown {
+  return {
+    tag: "button",
+    type,
+    text: { tag: "plain_text", content: text },
+    form_action_type: "submit",
+    name,
     behaviors: [{ type: "callback", value }],
   };
 }
@@ -86,6 +192,40 @@ function buttons(items: unknown[]): unknown {
       width: "auto",
       vertical_align: "top",
       elements: [element],
+    })),
+  };
+}
+
+function inputField(
+  name: string,
+  label: string,
+  options: { required?: boolean; max?: number; multiline?: boolean; placeholder?: string; value?: string } = {},
+): unknown {
+  return {
+    tag: "input",
+    name,
+    label: { tag: "plain_text", content: label },
+    placeholder: { tag: "plain_text", content: options.placeholder ?? "请输入" },
+    required: options.required ?? false,
+    width: "fill",
+    max_length: options.max ?? MAX_ANSWER_CHARS,
+    ...(options.value !== undefined && options.value !== "" ? { default_value: options.value } : {}),
+    ...(options.multiline === true ? { input_type: "multiline_text", rows: 4, auto_resize: true } : {}),
+  };
+}
+
+function routeSelect(draft: WizardDraft): unknown {
+  return {
+    tag: "select_static",
+    name: "route",
+    placeholder: { tag: "plain_text", content: "请选择" },
+    width: "fill",
+    required: true,
+    // initial_option 取的是**选项文本**（不是 value），所以这里用中文标签回填；回传的仍是 value。
+    ...(isRoute(draft.route) ? { initial_option: ROUTE_LABEL[draft.route] } : {}),
+    options: ROUTES.map((route) => ({
+      text: { tag: "plain_text", content: ROUTE_LABEL[route] },
+      value: route,
     })),
   };
 }
@@ -125,6 +265,8 @@ function stateLines(state: KbState): string {
   ].join("\n");
 }
 
+// ── 卡片 ────────────────────────────────────────────────────────────────────
+
 /** 主菜单。这个卡片留在群的主消息流里，别的卡片都收进它下面的话题。 */
 export function buildMenuCard(state: KbState, sign: ActionSigner): Card {
   return card({ title: "🤖 知识库管理", template: "blue" }, [
@@ -144,92 +286,99 @@ export function buildMenuCard(state: KbState, sign: ActionSigner): Card {
   ]);
 }
 
-/** 新增条目的表单卡片。字段名和 `kb.feishu.yaml` 的键一一对应，回传时不用翻译。 */
-export function buildFormCard(sign: ActionSigner): Card {
-  const input = (
-    name: string,
-    label: string,
-    options: { required?: boolean; max?: number; multiline?: boolean; placeholder?: string } = {},
-  ): unknown => ({
-    tag: "input",
-    name,
-    label: { tag: "plain_text", content: label },
-    placeholder: { tag: "plain_text", content: options.placeholder ?? "请输入" },
-    required: options.required ?? false,
-    width: "fill",
-    max_length: options.max ?? MAX_ANSWER_CHARS,
-    ...(options.multiline === true ? { input_type: "multiline_text", rows: 4, auto_resize: true } : {}),
-  });
-
-  return card({ title: "➕ 新增一条补充知识", template: "turquoise" }, [
-    md("填完点「提交」即刻生效（可回滚）。字段名和正式知识库一致，方便日后转正。"),
+/** 第一步：基本信息 + 处理方式。点「下一步」时才决定第二步要填哪个框。 */
+export function buildStep1Card(sign: ActionSigner, draft: WizardDraft): Card {
+  return card({ title: "➕ 新增一条补充知识（1/2）", template: "turquoise" }, [
+    md("先填基本信息、选好处理方式。点「下一步」后**只会显示这次真正要填的那一个**输入框。"),
     {
       tag: "form",
-      name: "kb_form",
+      name: "kb_step1",
       elements: [
-        input("id", "id（必填，全局唯一）", {
+        inputField("id", "id（必填，全局唯一）", {
           required: true,
           max: MAX_ID_CHARS,
           placeholder: "如 feishu-jwpt-phone",
+          value: draft.id,
         }),
-        input("title", "标题（必填）", { required: true, max: MAX_TITLE_CHARS, placeholder: "如 教务系统打不开" }),
-        input("keywords", "关键词（必填，逗号分隔）", {
+        inputField("title", "标题（必填）", {
+          required: true,
+          max: MAX_TITLE_CHARS,
+          placeholder: "如 教务系统打不开",
+          value: draft.title,
+        }),
+        inputField("keywords", "关键词（必填，逗号分隔）", {
           required: true,
           max: MAX_KEYWORDS_CHARS,
           placeholder: "如 教务,打不开,登录不上",
+          value: draft.keywords,
         }),
         // select_static 没有 label 属性（只有 input 有），所以标签用一个 markdown 兄弟节点，
         // 这也是官方表单示例里的写法。
         md("**处理方式（必填）**"),
-        {
-          tag: "select_static",
-          name: "route",
-          placeholder: { tag: "plain_text", content: "请选择" },
-          width: "fill",
-          required: true,
-          options: [
-            { text: { tag: "plain_text", content: ROUTE_LABEL.answer }, value: "answer" },
-            { text: { tag: "plain_text", content: ROUTE_LABEL.forward }, value: "forward" },
-            { text: { tag: "plain_text", content: ROUTE_LABEL.answer_and_forward }, value: "answer_and_forward" },
-          ],
-        },
-        input("answer", `答案（${ROUTE_LABEL.answer} / ${ROUTE_LABEL.answer_and_forward} 必填）`, {
-          multiline: true,
-          max: MAX_ANSWER_CHARS,
-          placeholder: "给同学看的话，不要写内部信息",
-        }),
-        input("forward_hint", "转交说明（需转交人工时建议填）", {
-          multiline: true,
-          max: MAX_FORWARD_HINT_CHARS,
-          placeholder: "处理人员需要同学提供什么材料",
-        }),
-        buttons([
-          {
-            tag: "button",
-            type: "primary_filled",
-            text: { tag: "plain_text", content: "提交" },
-            form_action_type: "submit",
-            name: "kb_submit",
-            behaviors: [{ type: "callback", value: sign({ op: OP.submit }) }],
-          },
-          {
-            tag: "button",
-            type: "default",
-            text: { tag: "plain_text", content: "重置" },
-            form_action_type: "reset",
-            name: "kb_reset",
-          },
-        ]),
+        routeSelect(draft),
+        buttons([submitButton("下一步", "primary_filled", "kb_next", draftValue(sign, OP.wizardNext, draft))]),
       ],
     },
     md(
-      `限制：标题 ≤ ${MAX_TITLE_CHARS} 字，答案 ≤ ${MAX_ANSWER_CHARS} 字，` +
-        `转交说明 ≤ ${MAX_FORWARD_HINT_CHARS} 字；id 不能和正式知识库或已有补充条目重复。`,
+      `限制：id ≤ ${MAX_ID_CHARS} 字（只能用字母、数字、下划线、短横线），标题 ≤ ${MAX_TITLE_CHARS} 字，` +
+        `关键词合计 ≤ ${MAX_KEYWORDS_CHARS} 字。`,
     ),
   ]);
 }
 
-/** 表单提交成功后**原地**替换表单卡片：去掉输入框，防止重复提交。 */
+/**
+ * 第二步：只显示这次要填的那个输入框。第一步的内容用**纯字符串**展示在上面
+ * （不做成 disabled 输入框：那需要客户端 V7.4+，而且「disabled 的输入框会不会随
+ * form_value 一起提交」文档没写清楚——权威值本来就在按钮的签名值里，展示用文本最省事）。
+ */
+export function buildStep2Card(draft: WizardDraft, sign: ActionSigner): Card {
+  const fields: unknown[] = [];
+  if (draft.route === "answer" || draft.route === "answer_and_forward") {
+    fields.push(
+      inputField("answer", "答案（给同学看的话）", {
+        multiline: true,
+        max: MAX_ANSWER_CHARS,
+        placeholder: "直接回复的内容，不要写内部信息",
+        value: draft.answer,
+      }),
+    );
+  }
+  if (draft.route === "forward" || draft.route === "answer_and_forward") {
+    fields.push(
+      inputField("forward_hint", "转交说明（处理人员需要同学提供什么材料）", {
+        multiline: true,
+        max: MAX_FORWARD_HINT_CHARS,
+        placeholder: "如：需要同学提供学号、报错截图",
+        value: draft.forward_hint,
+      }),
+    );
+  }
+
+  return card({ title: "➕ 新增一条补充知识（2/2）", template: "turquoise" }, [
+    md(
+      [
+        `**id**　\`${draft.id}\``,
+        `**标题**　${draft.title}`,
+        `**关键词**　${draft.keywords}`,
+        `**处理方式**　${routeLabel(draft.route)}`,
+      ].join("\n"),
+    ),
+    md("以上信息已经记下，要改点「↩️ 上一步」，**内容会原样带回去**。"),
+    {
+      tag: "form",
+      name: "kb_step2",
+      elements: [
+        ...fields,
+        buttons([
+          submitButton("✅ 提交", "primary_filled", "kb_submit", draftValue(sign, OP.submit, draft)),
+          submitButton("↩️ 上一步", "default", "kb_back", draftValue(sign, OP.wizardBack, draft)),
+        ]),
+      ],
+    },
+  ]);
+}
+
+/** 表单提交成功后**原地**替换掉那张向导卡片：去掉输入框，防止重复提交。 */
 export function buildSubmittedCard(entry: FeishuKbEntry): Card {
   return card({ title: "✅ 已提交", template: "green" }, [
     md(`**${entry.title}**（id \`${entry.id}\`）已经写入飞书补充知识库，下一次问答就会带上它。`),
@@ -240,7 +389,7 @@ export function buildSubmittedCard(entry: FeishuKbEntry): Card {
 /** 新增成功后**新发**的结果卡片，删除按钮就挂在这张卡上。 */
 export function buildAddedCard(entry: FeishuKbEntry, sign: ActionSigner): Card {
   const elements: unknown[] = [
-    md(`**处理方式**　${ROUTE_LABEL[entry.route]}\n**关键词**　${entry.keywords.join("、")}`),
+    md(`**处理方式**　${routeLabel(entry.route)}\n**关键词**　${entry.keywords.join("、")}`),
   ];
   if (entry.answer) elements.push(md(`**答案**\n${truncate(entry.answer, 600)}`));
   if (entry.forward_hint) elements.push(md(`**转交说明**\n${truncate(entry.forward_hint, 400)}`));

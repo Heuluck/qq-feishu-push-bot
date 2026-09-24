@@ -22,6 +22,7 @@ import type { FeishuLayerFile } from "../kb/feishu.js";
 import { FeishuEntrySchema, compileKnowledgeBase } from "../kb/kb.js";
 import type { KnowledgeBaseRuntime } from "../kb/runtime.js";
 import {
+  EMPTY_DRAFT,
   MAX_ANSWER_CHARS,
   MAX_FORWARD_HINT_CHARS,
   MAX_ID_CHARS,
@@ -31,13 +32,17 @@ import {
   buildAddedCard,
   buildDeletedCard,
   buildEntryListCard,
-  buildFormCard,
   buildMenuCard,
   buildResultCard,
+  buildStep1Card,
+  buildStep2Card,
   buildSubmittedCard,
   buildToggleResultCard,
+  draftFromValue,
+  isRoute,
+  mergeDraft,
 } from "./kbCards.js";
-import type { Card, KbState } from "./kbCards.js";
+import type { Card, KbState, WizardDraft } from "./kbCards.js";
 
 /** 事件体（SDK 会把 header 与 event 摊平成一个对象，所以字段都在顶层）。 */
 interface MessageReceiveData {
@@ -194,7 +199,12 @@ export class LarkKbAdmin {
     const msg = data.message;
     if (!msg?.message_id || !msg.chat_id) return;
     if (msg.chat_type !== "group") return;
-    if (msg.chat_id !== this.chatId) return;
+    if (msg.chat_id !== this.chatId) {
+      // 别静默丢掉：排查「@了机器人但日志里什么都没有」时，最大的坑就是分不清
+      // 「事件根本没到」和「到了但不是这个群」。留下这条，两种情况一眼可辨。
+      log.info("kb-admin", `收到其它群的消息，忽略：${msg.chat_id}（本机器人只在 ${this.chatId ?? "(未配置)"} 里工作）`);
+      return;
+    }
     if (!this.once(`msg:${msg.message_id}`)) return;
 
     const openId = data.sender?.sender_id?.open_id ?? "";
@@ -237,10 +247,15 @@ export class LarkKbAdmin {
 
     const op = String(verified.payload["op"] ?? "");
     try {
-      if (op === OP.submit) return await this.onSubmit(openId, data.action?.form_value ?? {}, messageId);
       switch (op) {
         case OP.add:
           return await this.onAdd(messageId);
+        case OP.wizardNext:
+          return await this.onWizardNext(verified.payload, data.action?.form_value ?? {});
+        case OP.wizardBack:
+          return await this.onWizardBack(verified.payload, data.action?.form_value ?? {});
+        case OP.submit:
+          return await this.onSubmit(openId, verified.payload, data.action?.form_value ?? {}, messageId);
         case OP.list:
           return await this.onList(messageId);
         case OP.toggle:
@@ -256,10 +271,35 @@ export class LarkKbAdmin {
     }
   }
 
-  /** ➕ 新增条目：不碰菜单卡片，另发一张表单卡片进话题。 */
+  /** ➕ 新增条目：不碰菜单卡片，另发一张向导卡片（第一步）进话题。 */
   private async onAdd(messageId: string): Promise<CallbackResponse> {
-    await this.replyCard(messageId, buildFormCard(this.sign), { inThread: true });
-    return toast("info", "表单已发到下方话题里，填完点「提交」");
+    await this.replyCard(messageId, buildStep1Card(this.sign, EMPTY_DRAFT), { inThread: true });
+    return toast("info", "表单已发到下方话题里，填完点「下一步」");
+  }
+
+  /**
+   * 向导第一步 → 第二步。
+   *
+   * 「下一步」是表单的提交按钮，所以这里能拿到 `form_value`（用户刚填的四个字段）；
+   * 返回的卡片会**原地替换**掉第一步那张卡。校验不过时只回 toast、**不返回 card**，
+   * 这样用户已经敲进去的内容原样留在屏幕上，改完直接再点一次即可。
+   */
+  private async onWizardNext(payload: Record<string, unknown>, form: Record<string, unknown>): Promise<CallbackResponse> {
+    const draft = mergeDraft(draftFromValue(payload), form);
+    const problem = this.checkStep1(draft);
+    if (problem !== "") return toast("error", problem);
+    return toastWithCard("info", "第二步：填这一项就够了", buildStep2Card(draft, this.sign));
+  }
+
+  /**
+   * 向导第二步 → 第一步（回退）。
+   *
+   * 这里同样能拿到 `form_value`（第二步那个输入框里已经敲了一半的内容），
+   * 于是回退后**再点「下一步」时那段内容还在**——第一/二步之间可以随便来回切。
+   */
+  private async onWizardBack(payload: Record<string, unknown>, form: Record<string, unknown>): Promise<CallbackResponse> {
+    const draft = mergeDraft(draftFromValue(payload), form);
+    return toastWithCard("info", "回到第一步", buildStep1Card(this.sign, draft));
   }
 
   /** 📋 查看补充条目。 */
@@ -327,19 +367,30 @@ export class LarkKbAdmin {
     return toastWithCard("success", `已删除「${entry.title}」`, buildDeletedCard(entry));
   }
 
-  /** 表单提交：校验 → 写盘 → 热重载 → 结果卡片。 */
-  private async onSubmit(openId: string, form: Record<string, unknown>, messageId: string): Promise<CallbackResponse> {
-    const text = (key: string): string => (typeof form[key] === "string" ? (form[key] as string) : "");
+  /** 向导第二步的提交：合并草稿 → 校验 → 写盘 → 热重载 → 结果卡片。 */
+  private async onSubmit(
+    openId: string,
+    payload: Record<string, unknown>,
+    form: Record<string, unknown>,
+    messageId: string,
+  ): Promise<CallbackResponse> {
+    // 第一步的 id/标题/关键词/处理方式在按钮的签名值里，第二步的答案/转交说明刚随
+    // form_value 上来 —— 合并成完整草稿。
+    const draft = mergeDraft(draftFromValue(payload), form);
+    const problem = this.checkStep1(draft);
+    if (problem !== "") return toast("error", problem);
+
+    const text = (value: string): string => value.trim();
     const candidate = {
-      id: text("id").trim(),
-      title: text("title").trim(),
-      keywords: text("keywords")
+      id: text(draft.id),
+      title: text(draft.title),
+      keywords: text(draft.keywords)
         .split(/[,，]/)
         .map((item) => item.trim())
         .filter((item) => item !== ""),
-      route: text("route").trim(),
-      answer: text("answer").trim() === "" ? undefined : text("answer").trim(),
-      forward_hint: text("forward_hint").trim() === "" ? undefined : text("forward_hint").trim(),
+      route: text(draft.route),
+      answer: text(draft.answer) === "" ? undefined : text(draft.answer),
+      forward_hint: text(draft.forward_hint) === "" ? undefined : text(draft.forward_hint),
       added_by: openId,
       added_at: new Date().toISOString(),
     };
@@ -361,8 +412,8 @@ export class LarkKbAdmin {
     const next: FeishuLayerFile = { ...file, entries: [...file.entries, entry] };
 
     // 用真正的编译器试一遍：id 与正式知识库撞车、变量引用不存在、总量超限都在这里拦下。
-    const problem = await this.tryCompile(next);
-    if (problem !== "") return toast("error", problem);
+    const compileProblem = await this.tryCompile(next);
+    if (compileProblem !== "") return toast("error", compileProblem);
 
     await this.store.save(next);
     await this.kb.reload();
@@ -383,6 +434,34 @@ export class LarkKbAdmin {
     void this.refreshMenu();
     void this.replyCard(messageId, buildAddedCard(entry, this.sign), { inThread: true });
     return toastWithCard("success", `已新增「${entry.title}」`, buildSubmittedCard(entry));
+  }
+
+  /**
+   * 第一步那四个字段的校验，返回空串表示通过。
+   *
+   * 「下一步」和「提交」两处都要调用：第二步的卡片里根本没有这四个字段，它们的值来自按钮的
+   * 签名回传，所以最终提交时必须重新验一遍。客户端上那四个框也带 `required`，但那是前端拦截，
+   * 只是体验优化、不能当校验。
+   */
+  private checkStep1(draft: WizardDraft): string {
+    const id = draft.id.trim();
+    if (id === "") return "请填 id";
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) return "id 只能用字母、数字、下划线、短横线";
+    if (id.length > MAX_ID_CHARS) return `id 不能超过 ${MAX_ID_CHARS} 个字符`;
+
+    const title = draft.title.trim();
+    if (title === "") return "请填标题";
+    if (title.length > MAX_TITLE_CHARS) return `标题不能超过 ${MAX_TITLE_CHARS} 个字符`;
+
+    const keywords = draft.keywords
+      .split(/[,，]/)
+      .map((item) => item.trim())
+      .filter((item) => item !== "");
+    if (keywords.length === 0) return "关键词至少填一个（用逗号分隔）";
+    if (keywords.join("、").length > MAX_KEYWORDS_CHARS) return `关键词合计不能超过 ${MAX_KEYWORDS_CHARS} 个字符`;
+
+    if (!isRoute(draft.route.trim())) return "请选择处理方式";
+    return "";
   }
 
   /** 卡片输入框能限住的长度先在这里再兜一遍（客户端可以绕过前端限制）。 */
