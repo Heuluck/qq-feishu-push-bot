@@ -147,6 +147,13 @@ entries:
     route: answer
     answer: |
       请联系学校水电中心售电咨询服务电话 0791-83969182 或 15797965280 (金老师)
+
+  - id: electric-service-tele
+    title: 水电服务电话
+    keywords: [水,电]
+    route: answer
+    answer: |
+      水电服务：0791-83969768；学生售电咨询服务：0791-83969182 或 15797965280
   
   - id: select-course-on-incu
     title: 南大家园的选课是真的吗
