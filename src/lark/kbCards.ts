@@ -297,9 +297,9 @@ export function buildMenuCard(state: KbState, sign: ActionSigner): Card {
     buttons([
       button("新增条目", "primary", sign({ op: OP.add })),
       button("查看飞书补充知识", "default", sign({ op: OP.list })),
-      // 标签写成中性的「切换」而不是「启用/停用」：卡片一旦发出就改不了文字，
-      // 而服务端是按当前状态取反，标签写成状态词迟早会和实际状态对不上。
-      button("切换飞书补充知识", "default", sign({ op: OP.toggle })),
+      // 标签用「开关」这个名词，不用「启用/停用」那种状态词：卡片一旦发出就改不了文字，
+      // 而服务端是按当前状态取反，写成状态词迟早会和实际状态对不上；「切换」又太容易被读成别的意思。
+      button("飞书补充知识开关", "default", sign({ op: OP.toggle })),
     ]),
   ]);
 }
@@ -464,7 +464,7 @@ export function buildEntryListCard(state: KbState, entries: FeishuKbEntry[], sig
   return card({ title: `飞书补充知识（${entries.length} 条）`, template: "blue" }, elements);
 }
 
-/** 切换注入开关后的结果卡片，带一个「切回去」的按钮。 */
+/** 开关操作的结果卡片，带一个能再按一次的按钮。 */
 export function buildToggleResultCard(state: KbState, sign: ActionSigner): Card {
   const on = state.feishuEnabled;
   return card(
@@ -472,7 +472,7 @@ export function buildToggleResultCard(state: KbState, sign: ActionSigner): Card 
     [
       md(stateLines(state)),
       buttons([
-        button("切换注入", "default", sign({ op: OP.toggle })),
+        button("开关", "default", sign({ op: OP.toggle })),
         button("查看飞书补充知识", "default", sign({ op: OP.list })),
       ]),
     ],

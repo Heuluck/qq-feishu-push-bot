@@ -1304,11 +1304,11 @@ const state: KbState = {
 };
 const menuOps = collectActions(buildMenuCard(state, (payload) => payload));
 check(
-  "菜单卡片：三个入口的回传值齐全（新增/查看/切换）",
+  "菜单卡片：三个入口的回传值齐全（新增/查看/开关）",
   ["kb.add", "kb.list", "kb.toggle"].every((op) => menuOps.some((value) => value["op"] === op)),
 );
 check(
-  "菜单卡片：切换按钮是中性的「切换」，不把状态词焊死在卡片上（卡片发出后改不了文字）",
+  "菜单卡片：开关按钮用中性的「开关」，不把状态词焊死在卡片上（卡片发出后改不了文字）",
   menuOps.some((value) => value["op"] === "kb.toggle") && !JSON.stringify(menuOps).includes('"to"'),
 );
 check(
@@ -1477,7 +1477,7 @@ check(
   JSON.stringify(buildEntryListCard(state, delEntries, identitySign)).includes("回收站"),
 );
 check(
-  "切换卡片：标题随目标状态变化",
+  "开关结果卡片：标题随目标状态变化",
   JSON.stringify(buildToggleResultCard({ ...state, feishuEnabled: false }, (payload) => payload)).includes("已停用") &&
     JSON.stringify(buildToggleResultCard({ ...state, feishuEnabled: true }, (payload) => payload)).includes("已启用"),
 );

@@ -7,7 +7,7 @@
  *   └─ 主菜单卡片（平铺在主消息流，成为话题的根）
  *       ├─ 新增条目     → 两步向导（进话题）→ 「已新增」卡片（带删除按钮）
  *       ├─ 查看补充条目 → 列表卡片（进话题，条目折叠）
- *       └─ 切换注入     → 结果卡片（进话题）
+ *       └─ 开关         → 结果卡片（进话题）
  * ```
  * 卡片之间的父子关系靠 `reply_in_thread: true` 建立：被回复的消息成为话题根，之后所有
  * 回复自动落回同一话题，所以**这一层不需要保存任何会话状态**。
@@ -353,7 +353,7 @@ export class LarkKbAdmin {
     return toast("info", "已发到下方话题");
   }
 
-  /** 切换「飞书补充知识」注入开关。按**当前状态取反**，不信任卡片上烘焙的旧状态。 */
+  /** 开 / 关「飞书补充知识」注入。按**当前状态取反**，不信任卡片上烘焙的旧状态。 */
   private async onToggle(messageId: string): Promise<CallbackResponse> {
     const { present, file } = await this.store.load();
     const wanted = !file.enabled;
