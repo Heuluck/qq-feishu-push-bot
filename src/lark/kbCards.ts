@@ -256,7 +256,7 @@ function stateLines(state: KbState): string {
   const feishu = state.feishuPresent
     ? state.feishuEnabled
       ? `已启用，${state.feishuCount} 条（fs-${state.feishuVersion}）`
-      : `已停用，${state.feishuCount} 条、仍在文件里（fs-${state.feishuVersion}）`
+      : `已停用，${state.feishuCount} 条仍在文件里（fs-${state.feishuVersion}）`
     : "无";
   return [
     `**正式知识库**　kb-${state.baseVersion}，${state.baseCount} 条`,
@@ -279,14 +279,12 @@ export function buildMenuCard(state: KbState, sign: ActionSigner): Card {
       // 而服务端是按当前状态取反，标签写成状态词迟早会和实际状态对不上。
       button("切换飞书补充注入", "default", sign({ op: OP.toggle })),
     ]),
-    md("卡片收在本条消息的话题里。飞书补充是临时的，长期保留要搬进 `kb/kb.yaml`。"),
   ]);
 }
 
 /** 第一步：基本信息 + 处理方式。点「下一步」时才决定第二步要填哪个框。 */
 export function buildStep1Card(sign: ActionSigner, draft: WizardDraft): Card {
   return card({ title: "新增补充知识 1/2", template: "turquoise" }, [
-    md("先填基本信息，下一步再填答案或转交说明。"),
     {
       tag: "form",
       name: "kb_step1",
@@ -364,10 +362,7 @@ export function buildStep2Card(draft: WizardDraft, sign: ActionSigner): Card {
     ),
     // 提示只讲这次真的出现的字段，别在「只填答案」时还念一遍转交说明。
     md(
-      [
-        ...(askAnswer ? ["答案会回复给同学"] : []),
-        ...(askForward ? ["转交说明只给处理人员看"] : []),
-      ].join("；") + "。要改内容点「上一步」。",
+      [...(askAnswer ? ["答案会回复给同学"] : []), ...(askForward ? ["转交说明只给处理人员看"] : [])].join("；") + "。",
     ),
     {
       tag: "form",
@@ -387,7 +382,6 @@ export function buildStep2Card(draft: WizardDraft, sign: ActionSigner): Card {
 export function buildSubmittedCard(entry: FeishuKbEntry): Card {
   return card({ title: "已提交", template: "green" }, [
     md(`**${entry.title}**（id \`${entry.id}\`）已写入飞书补充知识库，下一次问答生效。`),
-    md("结果卡片在话题里，24 小时内可删除。"),
   ]);
 }
 
@@ -448,9 +442,8 @@ export function buildToggleResultCard(state: KbState, sign: ActionSigner): Card 
     { title: on ? "补充知识已启用" : "补充知识已停用", template: on ? "green" : "grey" },
     [
       md(stateLines(state)),
-      md(on ? "已进入 system prompt，下一次问答生效。" : "条目仍在文件里，只是不再注入；正式知识库不受影响。"),
       buttons([
-        button("切换", "default", sign({ op: OP.toggle })),
+        button("切换注入", "default", sign({ op: OP.toggle })),
         button("查看补充条目", "default", sign({ op: OP.list })),
       ]),
     ],
