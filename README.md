@@ -79,6 +79,8 @@ src/
 
 复制 `.env.example` 为 `.env`（仓库里已给好 `.env`，内容一致），把 `PASTE_` 占位符换成真实值。程序只列出缺哪些变量，永远不会打印凭据内容。
 
+`.env` 的值也可以写成 1Password 引用（`LARK_APP_SECRET=op://私有/飞书机器人/app-secret`）：`npm run dev` / `npm start` 会经 `op run` 读取，`./deploy.sh` 上传前会用 `op inject` 就地解析——**只有解析后的明文上路**，解析失败或解析后仍有 `op://` 残留则拒绝上传，且值只走 SSH 的 stdin、不进命令行参数。
+
 ```bash
 # 先不填 QQ_GROUP_OPENID 也能跑：机器人会把看到的群 openid 打进日志
 grep "收到群消息" <日志>   # 复制 group=oc... / group=... 那个值填回去
@@ -112,6 +114,8 @@ docker compose restart      # 改完 kb/kb.yaml 后重启生效
 ```bash
 ./deploy.sh            # 全量：构建 → 上传 → 重建容器 → 自检
 ./deploy.sh --kb       # 只更新知识库并重启（1 条连接、几秒；改 kb/kb.yaml 时用这个）
+./deploy.sh --feishu   # 只更新知识库，且连 kb.feishu.yaml 一起推（线上原有那份先备份）
+./deploy.sh --pull     # 反向：把服务器上 kb/*.yaml 全部拉回本地并覆盖（以云上为准）
 ./deploy.sh --no-build # 跳过构建与上传，只同步代码并重建容器
 ./deploy.sh --logs     # 部署完直接跟日志
 ```
@@ -120,6 +124,8 @@ docker compose restart      # 改完 kb/kb.yaml 后重启生效
 
 > `kb/kb.feishu.yaml`（飞书补充层）**不走这条路**：容器里改完就地热重载，几秒生效、不用 deploy。
 > `deploy.sh` 的 tar 也刻意排除了这个文件——它是**服务器上的运行期状态**，不能被本机的试验内容覆盖。
+> 两个例外都有独立开关：`--pull` 把它**拉回来**（云上那份才是最新的），`--feishu` 显式把它**推上去**
+> （推送前会把线上原有那份备份进 `data/kb-feishu-snapshots/`，和程序自己留的快照同一套命名与保留策略）。
 
 它不会在服务器上执行 `docker compose build`，所以那台机器多小都能跑；但这也意味着改了 `src/` 之后必须在**本机**重新部署，服务器上那份源码只是留档。
 
@@ -258,8 +264,9 @@ entries:
 规模闸门：单条答案 ≤1000 字（飞书输入框的硬上限就是 1000），飞书层编译后 ≤`KB_FEISHU_MAX_CHARS`（默认 2000），
 合并后的 system prompt ≤`KB_MAX_PROMPT_CHARS`（默认 8000），超了直接拒绝写入并在卡片上说明。
 
-> 想给某一条「转正」：把它的条目原样复制进 `kb/kb.yaml` 的 `entries` 下面，再从飞书层删掉它
-> （`id` 不能两处同时存在）。`added_by` 记着是谁加的，方便去确认。
+> 想给某一条「转正」：先 `./deploy.sh --pull` 把服务器上的 `kb/*.yaml` 拉回本地，
+> 把那条原样复制进 `kb/kb.yaml` 的 `entries` 下面，再从飞书层删掉它（`id` 不能两处同时存在），
+> 最后 `./deploy.sh --kb` 发上去。`added_by` 记着是谁加的，方便去确认。
 
 **为什么飞书层追加在基线后面**：提示词缓存按字节前缀匹配。飞书层永远排在末尾，
 所以同学在飞书里频繁增删时，基线段仍然逐字节稳定、缓存照旧命中；
