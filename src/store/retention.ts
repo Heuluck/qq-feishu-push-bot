@@ -41,6 +41,8 @@ export const FILE_PATTERNS = {
   forwards: /^forwards-\d{4}-\d{2}\.jsonl$/,
   rawEvents: /^raw-events\.\d{8}-\d{6}\.jsonl$/,
   limitsArchive: /^limits\.\d{4}-\d{2}-\d{2}\.json$/,
+  /** 飞书知识库管理的操作留档（谁、什么时候、加了/删了哪一条）。 */
+  kbFeishuAudit: /^kb-feishu-audit-\d{4}-\d{2}\.jsonl$/,
 };
 
 export interface PruneResult {
@@ -115,6 +117,7 @@ export class Maintenance {
       pruneByAge(this.dataDir, FILE_PATTERNS.forwards, maxAgeMs),
       pruneByAge(this.dataDir, FILE_PATTERNS.rawEvents, maxAgeMs),
       pruneByAge(this.dataDir, FILE_PATTERNS.limitsArchive, maxAgeMs),
+      pruneByAge(this.dataDir, FILE_PATTERNS.kbFeishuAudit, maxAgeMs),
     ]);
     const deleted = results.flatMap((item) => item.deleted);
     if (deleted.length > 0) {

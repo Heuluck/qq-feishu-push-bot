@@ -93,6 +93,11 @@ export class FeedbackForwarder {
     log.info("lark", `已载入 ${this.topics.size} 个历史话题`);
   }
 
+  /** 反馈群 chat_id（`init()` 之后才有值）。知识库管理菜单也发在这个群里，避免再解析一遍。 */
+  get targetChatId(): string | undefined {
+    return this.chatId;
+  }
+
   async push(req: ForwardRequest): Promise<ForwardOutcome> {
     if (!this.chatId) return { ok: false, message: "转交通道尚未就绪，请稍后再试。" };
 

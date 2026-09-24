@@ -15,7 +15,9 @@ services:
     # 无 ports：机器人只走出站连接，不需要暴露任何端口
     mem_limit: 320m
     volumes:
-      - ./kb:/app/kb:ro
+      # kb/ 必须可写：飞书群里的管理菜单要往 kb/kb.feishu.yaml 追加补充知识。
+      # 基线 kb.yaml 仍然只由人手工改——卡片走的代码路径只认 KB_FEISHU_PATH 这一个文件。
+      - ./kb:/app/kb
       - ./data:/app/data
     logging:
       driver: json-file

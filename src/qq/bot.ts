@@ -44,7 +44,13 @@ export interface QqDeps {
   forwarder: FeedbackForwarder;
   limits: Limits;
   history: History;
-  systemPrompt: string;
+  /**
+   * 取当前 system prompt 的函数（不是字符串）。
+   *
+   * 知识库可以在飞书里改完就热重载，所以每次请求现取一次；取回来的永远是一整个字符串，
+   * 不存在读到「改了一半」的中间态。
+   */
+  systemPrompt: () => string;
 }
 
 export function createQqBot(deps: QqDeps): QQBot {
@@ -345,7 +351,7 @@ export function createQqBot(deps: QqDeps): QQBot {
           tools: EXPOSED_TOOLS,
           execTool: tools.exec,
         },
-        systemPrompt,
+        systemPrompt(),
       );
 
       const reply = ensureQuotaNotice(

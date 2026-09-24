@@ -125,6 +125,27 @@ const EnvSchema = z.object({
 
   // 路径与日志
   KB_PATH: z.string().trim().min(1).default("kb/kb.yaml"),
+  /**
+   * 飞书补充知识库。卡片写的是**这一份**，永远不碰 KB_PATH。
+   * 基线随镜像走、只由人手工改；这一份由群里的管理菜单写，随时能一键停用或回滚。
+   */
+  KB_FEISHU_PATH: z.string().trim().min(1).default("kb/kb.feishu.yaml"),
+  /** 是否在飞书群里开知识库管理菜单（需要开发者后台配好长连接的事件与回调订阅）。 */
+  KB_ADMIN_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+  /**
+   * 有权操作知识库菜单的成员 open_id，逗号分隔。
+   * **默认空 = 谁都操作不了**（安全默认）。机器人会把 @ 它的 open_id 打进日志，复制过来即可。
+   */
+  LARK_ADMIN_OPEN_IDS: z.string().trim().default(""),
+  /** 飞书补充层编译后的字符数上限——它是直接进 system prompt 的，必须有个闸。 */
+  KB_FEISHU_MAX_CHARS: z.coerce.number().int().min(100).max(50_000).default(2_000),
+  /** 合并后 system prompt 的字符数上限，超过就拒绝写入（不是只告警）。 */
+  KB_MAX_PROMPT_CHARS: z.coerce.number().int().min(1_000).max(200_000).default(8_000),
+  /** 卡片上那条「删除」按钮的有效期（小时）。 */
+  KB_DELETE_WINDOW_HOURS: z.coerce.number().int().min(1).max(720).default(24),
   DATA_DIR: z.string().trim().min(1).default("data"),
   /** 数据文件（转交留档/调试转储/配额归档）的保留天数。 */
   DATA_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(30),

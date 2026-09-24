@@ -3,25 +3,44 @@ import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
-const EntrySchema = z
-  .object({
-    id: z.string().trim().min(1),
-    title: z.string().trim().min(1),
-    keywords: z.array(z.string().trim().min(1)).min(1),
-    /**
-     * answer             直接回复，不建工单
-     * forward            只转交人工
-     * answer_and_forward 先回复用户，同时转交人工（用户自助能办、但可能需要人工兜底的场景）
-     */
-    route: z.enum(["answer", "forward", "answer_and_forward"]),
-    answer: z.string().trim().min(1).optional(),
-    forward_hint: z.string().trim().min(1).optional(),
-  })
-  .refine((entry) => entry.route === "forward" || Boolean(entry.answer), {
-    message: "route=answer / answer_and_forward 的条目必须提供 answer",
-  });
+const EntryObjectSchema = z.object({
+  id: z.string().trim().min(1),
+  title: z.string().trim().min(1),
+  keywords: z.array(z.string().trim().min(1)).min(1),
+  /**
+   * answer             直接回复，不建工单
+   * forward            只转交人工
+   * answer_and_forward 先回复用户，同时转交人工（用户自助能办、但可能需要人工兜底的场景）
+   */
+  route: z.enum(["answer", "forward", "answer_and_forward"]),
+  answer: z.string().trim().min(1).optional(),
+  forward_hint: z.string().trim().min(1).optional(),
+});
 
-const ROUTE_LABEL: Record<"answer" | "forward" | "answer_and_forward", string> = {
+/** route=answer / answer_and_forward 必须给 answer，否则模型没东西可回复。 */
+function answerRequired(entry: { route: string; answer?: string | undefined }): boolean {
+  return entry.route === "forward" || Boolean(entry.answer);
+}
+const ANSWER_REQUIRED = { message: "route=answer / answer_and_forward 的条目必须提供 answer" };
+
+const EntrySchema = EntryObjectSchema.refine(answerRequired, ANSWER_REQUIRED);
+
+/**
+ * 飞书层条目比基线多两个审计字段。
+ *
+ * 它们**不进提示词**（`renderBlock` 只认那五个字段），留在这里是因为：
+ *   - `added_at` 是「24 小时内才能删」的判据，必须和内容一起落盘，不能只信卡片里的值；
+ *   - `added_by` 让人工把手写条目搬进 `kb.yaml`（转正）时知道该找谁确认。
+ * zod 的 object 默认会丢掉未声明的键，所以这两个字段必须显式写进 schema 才活得下来。
+ */
+const FeishuEntrySchema = EntryObjectSchema.extend({
+  added_by: z.string().trim().min(1).optional(),
+  added_at: z.string().trim().min(1).optional(),
+}).refine(answerRequired, ANSWER_REQUIRED);
+
+export { FeishuEntrySchema };
+
+export const ROUTE_LABEL: Record<"answer" | "forward" | "answer_and_forward", string> = {
   answer: "可直接回复",
   forward: "需转交人工",
   answer_and_forward: "先回复用户，同时转交人工",
@@ -45,14 +64,43 @@ const KbFileSchema = z.object({
   entries: z.array(z.unknown()).min(1),
 });
 
+/**
+ * 飞书层文件。`entries` 允许为空（可以把条目全删光，或只留一个 `enabled: false` 的壳），
+ * 所以这里是 `.default([])` 而不是基线的 `.min(1)`。
+ *
+ * 导出是为了让 `kb/feishu.ts` 在「读进来改一改再写回去」时用同一套 schema 校验，
+ * 保证菜单写入的内容和启动加载时看到的是同一份解释。
+ */
+export const FeishuFileSchema = z.object({
+  /** 注入开关。关掉后整层不进提示词，条目仍在文件里，随时可以再打开。 */
+  enabled: z.boolean().default(true),
+  variables: z.record(z.string(), z.unknown()).optional(),
+  entries: z.array(z.unknown()).default([]),
+});
+
 export type KbEntry = z.infer<typeof EntrySchema>;
+export type FeishuKbEntry = z.infer<typeof FeishuEntrySchema>;
 
 export interface KnowledgeBase {
+  /** 两层内容的合并哈希，内容变则变（日志里那个 kb-<hash>）。 */
   version: string;
+  /** 只由 kb.yaml 决定——飞书层增删不会动它，前缀缓存才不会每次都全量失效。 */
+  baseVersion: string;
+  /** 只由 kb.feishu.yaml 决定；没有这一层时为空串。 */
+  feishuVersion: string;
+  /** 基线条目（kb.yaml）。 */
   entries: KbEntry[];
-  /** 编译后的知识库文本块（逐字节稳定，改内容才会变）。 */
+  /** 飞书层条目（含审计字段）。 */
+  feishuEntries: FeishuKbEntry[];
+  /** 飞书层是否存在（文件不存在时为 false，用于日志与菜单文案）。 */
+  feishuPresent: boolean;
+  /** 飞书层注入开关；文件不存在时为 true（没有内容可注入，取什么都不影响）。 */
+  feishuEnabled: boolean;
+  /** 编译后的基线段。 */
   block: string;
-  /** 完整 system prompt：静态规则 + 知识库，作为请求的固定前缀。 */
+  /** 编译后的飞书补充段；未启用或没有条目时为空串。 */
+  feishuBlock: string;
+  /** 完整 system prompt：静态规则 + 基线 + （启用时）飞书补充，作为请求的固定前缀。 */
   systemPrompt: string;
 }
 
@@ -121,7 +169,7 @@ const SYSTEM_RULES = `你是 QQ 群里的「南大家园」客服机器人，群
 - 你自己的回复**不要**带时间戳或「用户X:」这类前缀，直接说话。`;
 
 /** 由知识库原文派生的稳定版本号：内容变则版本变（缓存按设计失效一次）。 */
-function versionOf(raw: string): string {
+export function versionOf(raw: string): string {
   return createHash("sha256").update(raw).digest("hex").slice(0, 8);
 }
 
@@ -161,9 +209,18 @@ function variableText(file: string, name: string, value: unknown): string {
   );
 }
 
-/** 展开 variables 自身：变量可以引用变量，循环引用直接报错。 */
-function expandVariables(raw: Record<string, unknown>, file: string): Map<string, string> {
-  const done = new Map<string, string>();
+/**
+ * 展开 variables 自身：变量可以引用变量，循环引用直接报错。
+ *
+ * `fallback` 是上一层已经展开好的变量表（飞书层可以引用 kb.yaml 里的 `{{jwpt}}` 这类片段），
+ * 本层同名变量覆盖它。循环检测只看本层：跨层引用不可能成环，因为下层是死值。
+ */
+function expandVariables(
+  raw: Record<string, unknown>,
+  file: string,
+  fallback?: ReadonlyMap<string, string>,
+): Map<string, string> {
+  const done = new Map<string, string>(fallback ?? []);
   const stack: string[] = [];
 
   const expand = (name: string): string => {
@@ -213,13 +270,110 @@ function substituteVariables(value: unknown, vars: Map<string, string>, file: st
   return value;
 }
 
-export function loadKnowledgeBase(path: string): KnowledgeBase {
-  const raw = readFileSync(path, "utf8");
+/** 一层（kb.yaml 或 kb.feishu.yaml）的解析结果。 */
+interface Layer {
+  entries: unknown[];
+  vars: Map<string, string>;
+}
+
+function parseBaseLayer(raw: string, file: string): Layer {
   const doc = KbFileSchema.parse(parseYaml(raw));
-  const vars = expandVariables(doc.variables ?? {}, path);
-  const entries = z.array(EntrySchema).min(1).parse(substituteVariables(doc.entries, vars, path));
-  const version = versionOf(raw);
+  const vars = expandVariables(doc.variables ?? {}, file);
+  return { entries: substituteVariables(doc.entries, vars, file) as unknown[], vars };
+}
+
+function parseFeishuLayer(raw: string, file: string, fallback: ReadonlyMap<string, string>): Layer & { enabled: boolean } {
+  const doc = FeishuFileSchema.parse(parseYaml(raw));
+  const vars = expandVariables(doc.variables ?? {}, file, fallback);
+  return {
+    enabled: doc.enabled,
+    entries: substituteVariables(doc.entries, vars, file) as unknown[],
+    vars,
+  };
+}
+
+/**
+ * 条目 id 必须全局唯一。
+ *
+ * 飞书层是同学在卡片上手工填 id 的，最容易和基线条目撞车；撞了以后日志、审计和将来的
+ * 「按 id 删一条」都会指向错误的条目，所以这里宁可拒绝整份知识库也不放行。
+ * 报错里一次列全所有重复项，省得改一个报一个。
+ */
+function assertUniqueIds(base: KbEntry[], feishu: FeishuKbEntry[], feishuFile: string): void {
+  const seen = new Map<string, string>();
+  const dupes: string[] = [];
+  for (const entry of base) {
+    const where = seen.get(entry.id);
+    if (where !== undefined) dupes.push(`  - id「${entry.id}」在 ${where} 与本条目重复`);
+    else seen.set(entry.id, "kb.yaml");
+  }
+  for (const entry of feishu) {
+    const where = seen.get(entry.id);
+    if (where !== undefined) dupes.push(`  - id「${entry.id}」在 ${where} 与 ${feishuFile} 重复`);
+    else seen.set(entry.id, feishuFile);
+  }
+  if (dupes.length > 0) {
+    throw new Error(`知识库条目 id 必须全局唯一：\n${dupes.join("\n")}`);
+  }
+}
+
+/**
+ * 把两层原文编译成一份知识库（纯函数，不碰文件系统——飞书侧要拿它做「写盘前试编译」）。
+ *
+ * 顺序很关键：**基线在前、飞书层在后**。提示词缓存按字节前缀匹配，飞书层永远追加在末尾，
+ * 于是同学在飞书里频繁增删时，基线段的前缀仍然逐字节稳定、缓存照旧命中。
+ * 同理，基线段标题里的「共 N 条」只数基线条目——否则飞书加一条就会改掉基线段那一行。
+ */
+export function compileKnowledgeBase(
+  baseRaw: string,
+  baseFile: string,
+  feishuRaw: string | undefined,
+  feishuFile: string,
+): KnowledgeBase {
+  const baseLayer = parseBaseLayer(baseRaw, baseFile);
+  const entries = z.array(EntrySchema).min(1).parse(baseLayer.entries);
+
+  const feishuPresent = feishuRaw !== undefined;
+  const feishu = feishuRaw === undefined ? undefined : parseFeishuLayer(feishuRaw, feishuFile, baseLayer.vars);
+  const feishuEntries = feishu === undefined ? [] : z.array(FeishuEntrySchema).parse(feishu.entries);
+  assertUniqueIds(entries, feishuEntries, feishuFile);
+
+  const baseVersion = versionOf(baseRaw);
+  const feishuVersion = feishuRaw === undefined ? "" : versionOf(feishuRaw);
+  const feishuEnabled = feishu?.enabled ?? true;
+  const injectFeishu = feishuEnabled && feishuEntries.length > 0;
+
   const block = renderBlock(entries);
-  const systemPrompt = `${SYSTEM_RULES}\n\n# 知识库（版本 kb-${version}，共 ${entries.length} 条）\n\n${block}\n`;
-  return { version, entries, block, systemPrompt };
+  const feishuBlock = injectFeishu ? renderBlock(feishuEntries) : "";
+  const feishuSection = injectFeishu
+    ? `\n# 补充知识（版本 fs-${feishuVersion}，共 ${feishuEntries.length} 条）\n\n${feishuBlock}\n`
+    : "";
+
+  return {
+    version: versionOf(`${baseVersion}:${feishuRaw ?? ""}`),
+    baseVersion,
+    feishuVersion,
+    entries,
+    feishuEntries,
+    feishuPresent,
+    feishuEnabled,
+    block,
+    feishuBlock,
+    systemPrompt: `${SYSTEM_RULES}\n\n# 知识库（版本 kb-${baseVersion}，共 ${entries.length} 条）\n\n${block}\n${feishuSection}`,
+  };
+}
+
+/** 从磁盘读基线（必然存在）与飞书层（缺失即视为空层），编译成知识库。 */
+export function loadKnowledgeBase(basePath: string, feishuPath?: string): KnowledgeBase {
+  const baseRaw = readFileSync(basePath, "utf8");
+  let feishuRaw: string | undefined;
+  if (feishuPath !== undefined) {
+    try {
+      feishuRaw = readFileSync(feishuPath, "utf8");
+    } catch {
+      // 首次运行时飞书层还不存在，属于正常情况（菜单第一次写入时会创建它）。
+      feishuRaw = undefined;
+    }
+  }
+  return compileKnowledgeBase(baseRaw, basePath, feishuRaw, feishuPath ?? "kb/kb.feishu.yaml");
 }

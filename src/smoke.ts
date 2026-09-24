@@ -8,7 +8,25 @@ import { join } from "node:path";
 import sharp from "sharp";
 import type { Config } from "./core/config.js";
 import { stripMentions, truncateText } from "./core/text.js";
-import { loadKnowledgeBase } from "./kb/kb.js";
+import { loadKnowledgeBase, compileKnowledgeBase } from "./kb/kb.js";
+import type { FeishuKbEntry } from "./kb/kb.js";
+import {
+  FeishuKbStore,
+  checkDeletable,
+  parseFeishuFileText,
+  renderFeishuFileText,
+  signActionValue,
+  verifyActionValue,
+} from "./kb/feishu.js";
+import type { FeishuLayerFile } from "./kb/feishu.js";
+import {
+  buildAddedCard,
+  buildEntryListCard,
+  buildFormCard,
+  buildMenuCard,
+  buildToggleResultCard,
+} from "./lark/kbCards.js";
+import type { Card, KbState } from "./lark/kbCards.js";
 import { REPLY_HINT, buildMessages } from "./llm/messages.js";
 import { EXPOSED_TOOLS, FORWARD_FEEDBACK_TOOL, ForwardFeedbackArgs, SEND_FOLLOWUP_TOOL, SendFollowupArgs, createTurnTools } from "./llm/tools.js";
 import { extractTextToolCalls, runTextToolCalls } from "./llm/toolmarkup.js";
@@ -78,10 +96,10 @@ check(
   (kb.systemPrompt.match(/0791-83969101/g) ?? []).length === 2,
 );
 check(
-  "知识库：版本号只写一处，两条下载相关正文都带上",
-  // 只数「5.16.0」本身：两条正文的措辞不同（一条写「当前版本 {{...}}」、一条只写「（{{...}}）」），
-  // 按「当前版本 5.16.0」去数只会命中一条。
-  (kb.systemPrompt.match(/5\.16\.0/g) ?? []).length === 2,
+  "知识库：版本号只写一处，每一处引用都展开",
+  // 不去数死数字：kb.yaml 里新增一条引用 {{latest-version}} 的正文，这个用例就该继续通过。
+  (kb.systemPrompt.match(/5\.16\.0/g) ?? []).length ===
+    (readFileSync(process.env["KB_PATH"] ?? "kb/kb.yaml", "utf8").match(/\{\{\s*latest-version\s*\}\}/g) ?? []).length,
 );
 
 const nestedKb = loadKnowledgeBase(
@@ -1073,6 +1091,311 @@ check(
   kb.systemPrompt.includes("先回复用户，同时转交人工"),
 );
 check("知识库：覆盖原有 13 条中的其余条目", kb.entries.length >= 11, `${kb.entries.length} 条`);
+
+// 13. 飞书补充知识库（kb/kb.feishu.yaml）
+const baseRaw = readFileSync(process.env["KB_PATH"] ?? "kb/kb.yaml", "utf8");
+const feishuBody = (entries: string, enabled = true): string => `enabled: ${enabled}\nentries:\n${entries}`;
+const feishuEntry = (id: string): string =>
+  `  - id: ${id}\n    title: 标题-${id}\n    keywords: [关键词-${id}]\n    route: answer\n    answer: 答案-${id}\n`;
+
+const withFeishu = compileKnowledgeBase(baseRaw, "kb/kb.yaml", feishuBody(feishuEntry("feishu-a")), "kb/kb.feishu.yaml");
+check("飞书层：条目进入 system prompt", withFeishu.systemPrompt.includes("答案-feishu-a"));
+check("飞书层：单独成段，不与正式条目标题混在一起", withFeishu.systemPrompt.includes("# 补充知识"));
+check(
+  "飞书层：只增加 feishuEntries，不动基线 entries",
+  withFeishu.feishuEntries.length === 1 && withFeishu.entries.length === kb.entries.length,
+);
+check(
+  "飞书层：文件不存在时 system prompt 与旧版逐字节一致（部署当天不该白白失效缓存）",
+  compileKnowledgeBase(baseRaw, "kb/kb.yaml", undefined, "kb/kb.feishu.yaml").systemPrompt === kb.systemPrompt,
+);
+
+// 前缀缓存：飞书层怎么增删，基线段都必须逐字节不动。
+const prefixOf = (prompt: string): string => prompt.split("\n# 补充知识")[0]!;
+const otherFeishu = compileKnowledgeBase(baseRaw, "kb/kb.yaml", feishuBody(feishuEntry("feishu-b")), "kb/kb.feishu.yaml");
+check("飞书层：换一条不影响基线段（前缀缓存仍然命中）", prefixOf(otherFeishu.systemPrompt) === prefixOf(withFeishu.systemPrompt));
+check(
+  "飞书层：基线标题里的条数只数基线（飞书加条目不会改掉基线段那一行）",
+  prefixOf(withFeishu.systemPrompt).includes(`共 ${kb.entries.length} 条`),
+);
+
+const disabledFeishu = compileKnowledgeBase(baseRaw, "kb/kb.yaml", feishuBody(feishuEntry("feishu-a"), false), "kb/kb.feishu.yaml");
+check(
+  "飞书层：enabled=false 时不注入，但条目仍读得到",
+  !disabledFeishu.systemPrompt.includes("答案-feishu-a") &&
+    disabledFeishu.feishuEntries.length === 1 &&
+    disabledFeishu.feishuEnabled === false,
+);
+
+const compileError = (feishuRaw: string): string => {
+  try {
+    compileKnowledgeBase(baseRaw, "kb/kb.yaml", feishuRaw, "kb/kb.feishu.yaml");
+    return "";
+  } catch (error) {
+    return (error as Error).message;
+  }
+};
+check(
+  "飞书层：id 与正式知识库撞车时拒绝编译",
+  compileError(feishuBody(feishuEntry("greeting"))).includes("必须全局唯一"),
+);
+check(
+  "飞书层：层内 id 重复时拒绝编译",
+  compileError(feishuBody(`${feishuEntry("dup")}${feishuEntry("dup")}`)).includes("必须全局唯一"),
+);
+check(
+  "飞书层：可以引用正式知识库的变量（{{jwpt}} 这类片段不用重写一遍）",
+  compileKnowledgeBase(
+    baseRaw,
+    "kb/kb.yaml",
+    feishuBody(`  - id: fs-var\n    title: t\n    keywords: [k]\n    route: answer\n    answer: "入口 {{jwpt}}"\n`),
+    "kb/kb.feishu.yaml",
+  ).systemPrompt.includes("jwpt.ncu.edu.cn"),
+);
+check(
+  "飞书层：引用不存在的变量时拒绝编译（不会把花括号发给同学）",
+  compileError(feishuBody(`  - id: fs-bad\n    title: t\n    keywords: [k]\n    route: answer\n    answer: "见 {{nope}}"\n`)).includes(
+    "未定义",
+  ),
+);
+check(
+  "飞书层：route=answer 却没写答案时拒绝编译",
+  compileError(`enabled: true\nentries:\n  - id: fs-noanswer\n    title: t\n    keywords: [k]\n    route: answer\n`).includes("必须提供 answer"),
+);
+
+// 写出去再读回来：多行答案、变量表、审计字段都不能丢。
+const roundTrip: FeishuLayerFile = {
+  enabled: true,
+  variables: { site: "https://example.com/" },
+  entries: [
+    {
+      id: "rt",
+      title: "多行答案",
+      keywords: ["甲", "乙"],
+      route: "answer",
+      answer: "第一行\n第二行\n第三行",
+      added_by: "ou_smoke",
+      added_at: "2026-01-02T03:04:05.000Z",
+    },
+  ],
+};
+const roundTripped = parseFeishuFileText(renderFeishuFileText(roundTrip), "kb/kb.feishu.yaml");
+check(
+  "飞书层文件：写出去再读回来逐字段不变（含变量表与审计字段）",
+  JSON.stringify(roundTripped) === JSON.stringify(roundTrip),
+  JSON.stringify(roundTripped),
+);
+check(
+  "飞书层文件：写回时占位符不被展开（{{jwpt}} 原样留在文件里）",
+  parseFeishuFileText(
+    renderFeishuFileText({
+      enabled: true,
+      variables: undefined,
+      entries: [{ id: "p", title: "t", keywords: ["k"], route: "answer", answer: "见 {{jwpt}}" }],
+    }),
+    "kb/kb.feishu.yaml",
+  ).entries[0]?.answer === "见 {{jwpt}}",
+);
+
+// 14. 卡片回传签名（防伪造、防改字段、防重放旧卡片）
+const SECRET = "smoke-secret";
+const signedValue = signActionValue(SECRET, { op: "kb.del", id: "feishu-a", added_at: "2026-01-02T03:04:05.000Z" });
+const verified = verifyActionValue(SECRET, signedValue);
+check(
+  "卡片签名：验签通过并还原载荷",
+  verified.ok && verified.payload["op"] === "kb.del" && verified.payload["id"] === "feishu-a",
+);
+check("卡片签名：改掉任一字段就验不过", !verifyActionValue(SECRET, { ...signedValue, id: "feishu-b" }).ok);
+check("卡片签名：换密钥验不过", !verifyActionValue("other-secret", signedValue).ok);
+check(
+  "卡片签名：没有签名/不是对象/是 null 一律拒绝",
+  !verifyActionValue(SECRET, { op: "kb.add" }).ok &&
+    !verifyActionValue(SECRET, "kb.add").ok &&
+    !verifyActionValue(SECRET, null).ok,
+);
+
+// 15. 删除卡片的三重闸门（24 小时 / id 严格相等 / 时间戳自洽）
+const NOW = Date.parse("2026-03-01T12:00:00.000Z");
+const DAY_MS = 24 * 3_600_000;
+const delEntries: FeishuKbEntry[] = [
+  {
+    id: "card-added",
+    title: "卡片加的",
+    keywords: ["k"],
+    route: "answer",
+    answer: "a",
+    added_by: "ou_x",
+    added_at: new Date(NOW - 3_600_000).toISOString(),
+  },
+  { id: "manual", title: "手工写的", keywords: ["k"], route: "answer", answer: "a" },
+];
+const delAt = delEntries[0]!.added_at!;
+check("删除：id 精确命中且在窗口内 → 允许", checkDeletable(delEntries, "card-added", delAt, NOW, DAY_MS).ok);
+check("删除：id 不完全相等就不删（不做模糊匹配）", !checkDeletable(delEntries, "card-adde", delAt, NOW, DAY_MS).ok);
+check("删除：超过 24 小时 → 拒绝", !checkDeletable(delEntries, "card-added", delAt, NOW + DAY_MS + 1, DAY_MS).ok);
+check("删除：id 为空 → 拒绝", !checkDeletable(delEntries, "", delAt, NOW, DAY_MS).ok);
+check(
+  "删除：手工塞进文件的条目（没有 added_at）不受卡片管辖",
+  !checkDeletable(delEntries, "manual", "", NOW, DAY_MS).ok,
+);
+check(
+  "删除：卡片带回来的时间与文件对不上 → 拒绝",
+  !checkDeletable(delEntries, "card-added", "1999-01-01T00:00:00.000Z", NOW, DAY_MS).ok,
+);
+
+// 16. 管理卡片的结构（飞书不认的 JSON 只有真发一次才知道，这里先挡住低级错误）
+const collectActions = (card: Card): Record<string, unknown>[] => {
+  const out: Record<string, unknown>[] = [];
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    if (typeof node !== "object" || node === null) return;
+    const record = node as Record<string, unknown>;
+    if (record["tag"] === "button") {
+      const behaviors = record["behaviors"];
+      if (Array.isArray(behaviors)) {
+        for (const behavior of behaviors as Record<string, unknown>[]) {
+          if (behavior["type"] === "callback" && typeof behavior["value"] === "object" && behavior["value"] !== null) {
+            out.push(behavior["value"] as Record<string, unknown>);
+          }
+        }
+      }
+    }
+    for (const value of Object.values(record)) walk(value);
+  };
+  walk(card);
+  return out;
+};
+const collectNames = (card: Card, tag: string): string[] => {
+  const out: string[] = [];
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    if (typeof node !== "object" || node === null) return;
+    const record = node as Record<string, unknown>;
+    if (record["tag"] === tag && typeof record["name"] === "string") out.push(record["name"]);
+    for (const value of Object.values(record)) walk(value);
+  };
+  walk(card);
+  return out;
+};
+// smoke 里用恒等签名：这里只验结构，签名本身在第 14 段单独验。
+const state: KbState = {
+  baseVersion: "aaaa1111",
+  baseCount: 20,
+  feishuVersion: "bbbb2222",
+  feishuEnabled: true,
+  feishuCount: 1,
+  promptChars: 6500,
+  feishuPresent: true,
+};
+const menuOps = collectActions(buildMenuCard(state, (payload) => payload));
+check(
+  "菜单卡片：三个入口的回传值齐全（新增/查看/切换）",
+  ["kb.add", "kb.list", "kb.toggle"].every((op) => menuOps.some((value) => value["op"] === op)),
+);
+check(
+  "菜单卡片：切换按钮是中性的「切换」，不把状态词焊死在卡片上（卡片发出后改不了文字）",
+  menuOps.some((value) => value["op"] === "kb.toggle") && !JSON.stringify(menuOps).includes('"to"'),
+);
+check(
+  "菜单卡片：JSON 2.0 且元素挂在 body.elements 下",
+  buildMenuCard(state, (payload) => payload)["schema"] === "2.0" &&
+    Array.isArray((buildMenuCard(state, (payload) => payload)["body"] as Record<string, unknown>)["elements"]),
+);
+const formCard = buildFormCard((payload) => payload);
+check(
+  "表单卡片：字段名与 kb.feishu.yaml 的键一一对应",
+  collectNames(formCard, "input").join(",") === "id,title,keywords,answer,forward_hint" &&
+    collectNames(formCard, "select_static").join(",") === "route",
+);
+check(
+  "表单卡片：提交按钮带回 kb.submit，且挂在表单容器里",
+  collectActions(formCard).some((value) => value["op"] === "kb.submit") &&
+    collectNames(formCard, "form").length === 1,
+);
+check(
+  "表单卡片：必填字段真的标了 required（前端就拦住，省一次往返）",
+  (((formCard["body"] as Record<string, unknown>)["elements"] as Record<string, unknown>[]).find(
+    (element) => element["tag"] === "form",
+  )?.["elements"] as Record<string, unknown>[]).filter((element) => element["required"] === true).length === 4,
+);
+const addedAt = "2026-01-02T03:04:05.000Z";
+const addedActions = collectActions(
+  buildAddedCard({ ...delEntries[0]!, added_at: addedAt }, (payload) => payload),
+);
+check(
+  "已新增卡片：删除按钮带着 id 与添加时间（服务端据此判断 24 小时与精确匹配）",
+  addedActions.some((value) => value["op"] === "kb.del" && value["id"] === "card-added" && value["added_at"] === addedAt),
+);
+check(
+  "已新增卡片：按钮是 danger 样式，一眼看出是危险操作",
+  JSON.stringify(buildAddedCard(delEntries[0]!, (payload) => payload)).includes('"danger"'),
+);
+check(
+  "查看卡片：条目收在折叠面板里（默认收起，不刷屏）",
+  JSON.stringify(buildEntryListCard(state, delEntries)).includes('"collapsible_panel"') &&
+    JSON.stringify(buildEntryListCard(state, delEntries)).includes('"expanded":false'),
+);
+check(
+  "查看卡片：空库时给一句人话，不给空白卡片",
+  JSON.stringify(buildEntryListCard({ ...state, feishuCount: 0 }, [])).includes("现在是空的"),
+);
+check(
+  "切换卡片：标题随目标状态变化",
+  JSON.stringify(buildToggleResultCard({ ...state, feishuEnabled: false }, (payload) => payload)).includes("已停用") &&
+    JSON.stringify(buildToggleResultCard({ ...state, feishuEnabled: true }, (payload) => payload)).includes("已启用"),
+);
+
+// 17. 飞书层落盘：原子写、快照、审计
+const storeRoot = "data/smoke-tmp/feishu-store";
+rmSync(storeRoot, { recursive: true, force: true });
+const storePath = join(storeRoot, "kb", "kb.feishu.yaml");
+const store = new FeishuKbStore(storePath, join(storeRoot, "data"));
+const storeEntry = (id: string): FeishuKbEntry => ({
+  id,
+  title: `标题-${id}`,
+  keywords: ["k"],
+  route: "answer",
+  answer: "a",
+  added_by: "ou_smoke",
+  added_at: new Date().toISOString(),
+});
+const beforeWrite = await store.load();
+check(
+  "落盘：文件还不存在时返回空的启用层，而不是报错",
+  beforeWrite.present === false && beforeWrite.file.enabled && beforeWrite.file.entries.length === 0,
+);
+await store.save({ enabled: true, variables: undefined, entries: [storeEntry("s1")] });
+const afterFirst = await store.load();
+check(
+  "落盘：写进去能原样读回来，且自动建好了目录",
+  afterFirst.present && afterFirst.file.entries.length === 1 && afterFirst.file.entries[0]?.id === "s1",
+);
+check("落盘：文件表头写明「请勿手工编辑」并给出转正办法", readFileSync(storePath, "utf8").includes("请勿手工编辑"));
+await store.save({ ...afterFirst.file, entries: [...afterFirst.file.entries, storeEntry("s2")] });
+check("落盘：第二次写入前先留存快照", (await store.listSnapshots()).length === 1);
+check(
+  "落盘：按 id 精确删除只动那一条",
+  (await store.removeEntry("s1"))?.id === "s1" &&
+    (await store.load()).file.entries.map((item) => item.id).join(",") === "s2",
+);
+check("落盘：删不存在的 id 返回 undefined 且文件不变", (await store.removeEntry("nope")) === undefined);
+await store.audit({ action: "add", id: "s1", actor: "ou_smoke" });
+const auditPath = join(storeRoot, "data", `kb-feishu-audit-${monthKey()}.jsonl`);
+check(
+  "落盘：审计写进按月切分的文件（受保留策略管辖），内容可读",
+  existsSync(auditPath) && readFileSync(auditPath, "utf8").includes('"id":"s1"'),
+);
+check(
+  "落盘：审计文件匹配保留策略的文件名，过期会被自动清掉",
+  FILE_PATTERNS.kbFeishuAudit.test(`kb-feishu-audit-${monthKey()}.jsonl`),
+);
+rmSync(storeRoot, { recursive: true, force: true });
 
 console.log(failed === 0 ? "\n全部通过 ✅" : `\n有 ${failed} 项失败 ❌`);
 process.exitCode = failed === 0 ? 0 : 1;
