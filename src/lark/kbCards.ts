@@ -230,6 +230,15 @@ function routeSelect(draft: WizardDraft): unknown {
   };
 }
 
+/** 关键词在卡片上一律用顿号分隔——用户填的时候可能用半角逗号、全角逗号或混着来。 */
+function formatKeywords(raw: string): string {
+  return raw
+    .split(/[,，]/)
+    .map((item) => item.trim())
+    .filter((item) => item !== "")
+    .join("、");
+}
+
 function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…（已截断）` : text;
 }
@@ -256,12 +265,12 @@ function stateLines(state: KbState): string {
   const feishu = state.feishuPresent
     ? state.feishuEnabled
       ? `已启用，${state.feishuCount} 条（fs-${state.feishuVersion}）`
-      : `已停用，${state.feishuCount} 条仍在文件里（fs-${state.feishuVersion}）`
+      : `已停用，${state.feishuCount} 条（fs-${state.feishuVersion}）`
     : "无";
   return [
     `**正式知识库**　kb-${state.baseVersion}，${state.baseCount} 条`,
-    `**飞书补充**　${feishu}`,
-    `**当前提示词**　${state.promptChars} 字符`,
+    `**飞书补充知识**　${feishu}`,
+    `**当前提示词**　${state.promptChars} 字`,
   ].join("\n");
 }
 
@@ -274,17 +283,17 @@ export function buildMenuCard(state: KbState, sign: ActionSigner): Card {
     hr(),
     buttons([
       button("新增条目", "primary", sign({ op: OP.add })),
-      button("查看补充条目", "default", sign({ op: OP.list })),
+      button("查看飞书补充知识", "default", sign({ op: OP.list })),
       // 标签写成中性的「切换」而不是「启用/停用」：卡片一旦发出就改不了文字，
       // 而服务端是按当前状态取反，标签写成状态词迟早会和实际状态对不上。
-      button("切换飞书补充注入", "default", sign({ op: OP.toggle })),
+      button("切换飞书补充知识", "default", sign({ op: OP.toggle })),
     ]),
   ]);
 }
 
 /** 第一步：基本信息 + 处理方式。点「下一步」时才决定第二步要填哪个框。 */
 export function buildStep1Card(sign: ActionSigner, draft: WizardDraft): Card {
-  return card({ title: "新增补充知识 1/2", template: "turquoise" }, [
+  return card({ title: "新增飞书补充知识 1/2", template: "turquoise" }, [
     {
       tag: "form",
       name: "kb_step1",
@@ -316,7 +325,7 @@ export function buildStep1Card(sign: ActionSigner, draft: WizardDraft): Card {
     },
     md(
       `id 全局唯一，只能用字母、数字、下划线、短横线（≤ ${MAX_ID_CHARS} 字）；` +
-        `标题 ≤ ${MAX_TITLE_CHARS} 字；关键词用逗号分隔、合计 ≤ ${MAX_KEYWORDS_CHARS} 字。`,
+        `标题 ≤ ${MAX_TITLE_CHARS} 字；关键词用逗号分隔、合计 ≤ ${MAX_KEYWORDS_CHARS} 字`,
     ),
   ]);
 }
@@ -351,18 +360,18 @@ export function buildStep2Card(draft: WizardDraft, sign: ActionSigner): Card {
     );
   }
 
-  return card({ title: "新增补充知识 2/2", template: "turquoise" }, [
+  return card({ title: "新增飞书补充知识 2/2", template: "turquoise" }, [
     md(
       [
         `**id**　\`${draft.id}\``,
         `**标题**　${draft.title}`,
-        `**关键词**　${draft.keywords}`,
+        `**关键词**　${formatKeywords(draft.keywords)}`,
         `**处理方式**　${routeLabel(draft.route)}`,
       ].join("\n"),
     ),
     // 提示只讲这次真的出现的字段，别在「只填答案」时还念一遍转交说明。
     md(
-      [...(askAnswer ? ["答案会回复给同学"] : []), ...(askForward ? ["转交说明只给处理人员看"] : [])].join("；") + "。",
+      [...(askAnswer ? ["答案会回复给同学"] : []), ...(askForward ? ["转交说明只给处理人员看"] : [])].join("；"),
     ),
     {
       tag: "form",
@@ -381,7 +390,7 @@ export function buildStep2Card(draft: WizardDraft, sign: ActionSigner): Card {
 /** 表单提交成功后**原地**替换掉那张向导卡片：去掉输入框，防止重复提交。 */
 export function buildSubmittedCard(entry: FeishuKbEntry): Card {
   return card({ title: "已提交", template: "green" }, [
-    md(`**${entry.title}**（id \`${entry.id}\`）已写入飞书补充知识库，下一次问答生效。`),
+    md(`**${entry.title}**（id \`${entry.id}\`）已写入飞书补充知识，下一次提问即生效`),
   ]);
 }
 
@@ -396,14 +405,14 @@ export function buildAddedCard(entry: FeishuKbEntry, sign: ActionSigner): Card {
   elements.push(
     button("删除这一条", "danger", sign({ op: OP.del, id: entry.id, added_at: entry.added_at ?? "" })),
   );
-  elements.push(md("24 小时内可删；只删 id 相同的那一条。"));
+  elements.push(md("24 小时内可删除（只删这一条）"));
   return card({ title: `已新增：${entry.title}`, template: "green" }, elements);
 }
 
 /** 删除成功后**原地**替换那张「已新增」卡片：按钮消失，防止重复点。 */
 export function buildDeletedCard(entry: FeishuKbEntry): Card {
   return card({ title: "已删除", template: "grey" }, [
-    md(`**${entry.title}**（id \`${entry.id}\`）已从飞书补充知识库移除。`),
+    md(`**${entry.title}**（id \`${entry.id}\`）已从飞书补充知识移除`),
   ]);
 }
 
@@ -411,7 +420,7 @@ export function buildDeletedCard(entry: FeishuKbEntry): Card {
 export function buildResultCard(ok: boolean, title: string, lines: string[]): Card {
   return card(
     { title, template: ok ? "green" : "orange" },
-    lines.length > 0 ? lines.map((line) => md(line)) : [md("没有更多信息。")],
+    lines.length > 0 ? lines.map((line) => md(line)) : [md("没有更多信息")],
   );
 }
 
@@ -419,7 +428,7 @@ export function buildResultCard(ok: boolean, title: string, lines: string[]): Ca
 export function buildEntryListCard(state: KbState, entries: FeishuKbEntry[]): Card {
   const elements: unknown[] = [md(stateLines(state)), hr()];
   if (entries.length === 0) {
-    elements.push(md("飞书补充知识库为空。"));
+    elements.push(md("飞书补充知识为空"));
   } else {
     // 卡片消息有 30KB 上限，条目多时把答案截短，避免整张卡发不出去。
     const budget = entries.length > 20 ? 120 : 300;
@@ -431,20 +440,20 @@ export function buildEntryListCard(state: KbState, entries: FeishuKbEntry[]): Ca
       elements.push(panel(`\`${entry.id}\`　${entry.title}${added}`, lines.map((line) => md(line))));
     }
   }
-  elements.push(md("转正：复制进 `kb/kb.yaml`，再从飞书层删掉（id 不能两处同时存在）。"));
-  return card({ title: `飞书补充条目（${entries.length} 条）`, template: "blue" }, elements);
+  elements.push(md("转正：复制进 `kb/kb.yaml`，再从飞书补充知识删掉（id 不能两处同时存在）"));
+  return card({ title: `飞书补充知识（${entries.length} 条）`, template: "blue" }, elements);
 }
 
 /** 切换注入开关后的结果卡片，带一个「切回去」的按钮。 */
 export function buildToggleResultCard(state: KbState, sign: ActionSigner): Card {
   const on = state.feishuEnabled;
   return card(
-    { title: on ? "补充知识已启用" : "补充知识已停用", template: on ? "green" : "grey" },
+    { title: on ? "飞书补充知识已启用" : "飞书补充知识已停用", template: on ? "green" : "grey" },
     [
       md(stateLines(state)),
       buttons([
         button("切换注入", "default", sign({ op: OP.toggle })),
-        button("查看补充条目", "default", sign({ op: OP.list })),
+        button("查看飞书补充知识", "default", sign({ op: OP.list })),
       ]),
     ],
   );

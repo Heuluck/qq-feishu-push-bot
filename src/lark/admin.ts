@@ -237,7 +237,7 @@ export class LarkKbAdmin {
     const messageId = data.context?.open_message_id ?? "";
 
     if (this.chatId === undefined || chatId !== this.chatId) {
-      return toast("error", "这张卡片不属于知识库管理群");
+      return toast("error", "这张卡片不在知识库管理群里");
     }
     if (!this.isAdmin(openId)) {
       log.warn("kb-admin", `非白名单成员点击了知识库卡片：open_id=${openId}`);
@@ -268,7 +268,7 @@ export class LarkKbAdmin {
         case OP.del:
           return await this.onDelete(openId, verified.payload, messageId);
         default:
-          return toast("warning", `不认识的操作：${op === "" ? "(空)" : op}`);
+          return toast("warning", `未知操作：${op === "" ? "(空)" : op}`);
       }
     } catch (err) {
       log.error("kb-admin", `处理 ${op} 失败：${errorText(err)}`);
@@ -279,7 +279,7 @@ export class LarkKbAdmin {
   /** 新增条目：不碰菜单卡片，另发一张向导卡片（第一步）进话题。 */
   private async onAdd(messageId: string): Promise<CallbackResponse> {
     await this.replyCard(messageId, buildStep1Card(this.sign, EMPTY_DRAFT), { inThread: true });
-    return toast("info", "见下方话题。");
+    return toast("info", "已发到下方话题");
   }
 
   /**
@@ -311,14 +311,14 @@ export class LarkKbAdmin {
   private async onList(messageId: string): Promise<CallbackResponse> {
     const { file } = await this.store.load();
     await this.replyCard(messageId, buildEntryListCard(this.state(), file.entries), { inThread: true });
-    return toast("info", "见下方话题。");
+    return toast("info", "已发到下方话题");
   }
 
   /** 切换「飞书补充知识」注入开关。按**当前状态取反**，不信任卡片上烘焙的旧状态。 */
   private async onToggle(messageId: string): Promise<CallbackResponse> {
     const { present, file } = await this.store.load();
     const wanted = !file.enabled;
-    if (!present && !wanted) return toast("info", "还没有补充条目，无需停用");
+    if (!present && !wanted) return toast("info", "飞书补充知识为空，无需停用");
     const next: FeishuLayerFile = { ...file, enabled: wanted };
     await this.store.save(next);
     await this.kb.reload();
@@ -328,7 +328,7 @@ export class LarkKbAdmin {
     await this.replyCard(messageId, buildToggleResultCard(state, this.sign), { inThread: true });
     // 菜单上的状态行也得跟着变，否则它一直显示旧状态。
     void this.refreshMenu();
-    return toast("success", wanted ? `已启用，${state.feishuCount} 条` : "已停用。");
+    return toast("success", wanted ? `已启用，${state.feishuCount} 条` : "已停用");
   }
 
   /** 删除刚添加的那一条：24 小时窗口 + id 严格相等 + 签名三重校验。 */
@@ -358,7 +358,7 @@ export class LarkKbAdmin {
     void this.refreshMenu();
     void this.replyCard(
       messageId,
-      buildResultCard(true, `已删除：${entry.title}`, [`**id**　\`${entry.id}\``, "下一次问答不再包含它。"]),
+      buildResultCard(true, `已删除：${entry.title}`, [`**id**　\`${entry.id}\``]),
       { inThread: true },
     );
     return toastWithCard("success", `已删除「${entry.title}」`, buildDeletedCard(entry));
@@ -404,7 +404,7 @@ export class LarkKbAdmin {
 
     const { file } = await this.store.load();
     if (file.entries.some((item) => item.id === entry.id)) {
-      return toast("error", `id「${entry.id}」在飞书补充层里已经有了，换一个`);
+      return toast("error", `id「${entry.id}」已存在，请换一个`);
     }
     const next: FeishuLayerFile = { ...file, entries: [...file.entries, entry] };
 
@@ -444,18 +444,18 @@ export class LarkKbAdmin {
     const id = draft.id.trim();
     if (id === "") return "请填 id";
     if (!/^[A-Za-z0-9_-]+$/.test(id)) return "id 只能用字母、数字、下划线、短横线";
-    if (id.length > MAX_ID_CHARS) return `id 不能超过 ${MAX_ID_CHARS} 个字符`;
+    if (id.length > MAX_ID_CHARS) return `id 不能超过 ${MAX_ID_CHARS} 字`;
 
     const title = draft.title.trim();
     if (title === "") return "请填标题";
-    if (title.length > MAX_TITLE_CHARS) return `标题不能超过 ${MAX_TITLE_CHARS} 个字符`;
+    if (title.length > MAX_TITLE_CHARS) return `标题不能超过 ${MAX_TITLE_CHARS} 字`;
 
     const keywords = draft.keywords
       .split(/[,，]/)
       .map((item) => item.trim())
       .filter((item) => item !== "");
     if (keywords.length === 0) return "关键词至少填一个（用逗号分隔）";
-    if (keywords.join("、").length > MAX_KEYWORDS_CHARS) return `关键词合计不能超过 ${MAX_KEYWORDS_CHARS} 个字符`;
+    if (keywords.join("、").length > MAX_KEYWORDS_CHARS) return `关键词合计不能超过 ${MAX_KEYWORDS_CHARS} 字`;
 
     if (!isRoute(draft.route.trim())) return "请选择处理方式";
     return "";
@@ -464,15 +464,15 @@ export class LarkKbAdmin {
   /** 卡片输入框能限住的长度先在这里再兜一遍（客户端可以绕过前端限制）。 */
   private checkLengths(entry: { id: string; title: string; keywords: string[]; answer?: string; forward_hint?: string }): string {
     if (!/^[A-Za-z0-9_-]+$/.test(entry.id)) return "id 只能用字母、数字、下划线、短横线";
-    if (entry.id.length > MAX_ID_CHARS) return `id 不能超过 ${MAX_ID_CHARS} 个字符`;
-    if (entry.title.length > MAX_TITLE_CHARS) return `标题不能超过 ${MAX_TITLE_CHARS} 个字符`;
+    if (entry.id.length > MAX_ID_CHARS) return `id 不能超过 ${MAX_ID_CHARS} 字`;
+    if (entry.title.length > MAX_TITLE_CHARS) return `标题不能超过 ${MAX_TITLE_CHARS} 字`;
     const keywords = entry.keywords.join("、");
-    if (keywords.length > MAX_KEYWORDS_CHARS) return `关键词合计不能超过 ${MAX_KEYWORDS_CHARS} 个字符`;
+    if (keywords.length > MAX_KEYWORDS_CHARS) return `关键词合计不能超过 ${MAX_KEYWORDS_CHARS} 字`;
     if (entry.answer !== undefined && entry.answer.length > MAX_ANSWER_CHARS) {
-      return `答案不能超过 ${MAX_ANSWER_CHARS} 个字符`;
+      return `答案不能超过 ${MAX_ANSWER_CHARS} 字`;
     }
     if (entry.forward_hint !== undefined && entry.forward_hint.length > MAX_FORWARD_HINT_CHARS) {
-      return `转交说明不能超过 ${MAX_FORWARD_HINT_CHARS} 个字符`;
+      return `转交说明不能超过 ${MAX_FORWARD_HINT_CHARS} 字`;
     }
     return "";
   }
@@ -489,10 +489,10 @@ export class LarkKbAdmin {
       const compiled = compileKnowledgeBase(await this.kb.baseRaw(), this.cfg.KB_PATH, raw, this.store.filePath);
       const feishuChars = compiled.feishuBlock.length;
       if (feishuChars > this.cfg.KB_FEISHU_MAX_CHARS) {
-        return `飞书补充层会膨胀到 ${feishuChars} 字符，超过上限 ${this.cfg.KB_FEISHU_MAX_CHARS}；请先精简或转正几条`;
+        return `飞书补充知识已达 ${feishuChars} 字，超过上限 ${this.cfg.KB_FEISHU_MAX_CHARS}，请精简或转正`;
       }
       if (compiled.systemPrompt.length > this.cfg.KB_MAX_PROMPT_CHARS) {
-        return `合并后的 system prompt 会到 ${compiled.systemPrompt.length} 字符，超过上限 ${this.cfg.KB_MAX_PROMPT_CHARS}；请先精简`;
+        return `提示词已达 ${compiled.systemPrompt.length} 字，超过上限 ${this.cfg.KB_MAX_PROMPT_CHARS}，请精简`;
       }
       return "";
     } catch (err) {

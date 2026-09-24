@@ -149,20 +149,20 @@ export function checkDeletable(
   now: number,
   windowMs: number,
 ): { ok: true; entry: FeishuKbEntry } | { ok: false; reason: string } {
-  if (id === "") return { ok: false, reason: "回传数据里没有条目 id" };
+  if (id === "") return { ok: false, reason: "缺少条目 id" };
   const entry = entries.find((item) => item.id === id);
-  if (entry === undefined) return { ok: false, reason: `id「${id}」已经不在飞书补充层里了` };
+  if (entry === undefined) return { ok: false, reason: `id「${id}」已不存在（可能已被删除）` };
   if (entry.added_at === undefined || entry.added_at === "") {
-    return { ok: false, reason: "这条不是通过卡片添加的，请直接编辑 kb/kb.feishu.yaml" };
+    return { ok: false, reason: "该条目不是通过卡片添加的，请直接编辑 kb/kb.feishu.yaml" };
   }
   if (cardAddedAt !== entry.added_at) {
-    return { ok: false, reason: "卡片里的时间和当前条目对不上，可能已经被改过，请重新打开菜单" };
+    return { ok: false, reason: "条目已变更，请重新打开菜单" };
   }
   const age = now - Date.parse(entry.added_at);
   if (!Number.isFinite(age) || age < 0 || age > windowMs) {
     return {
       ok: false,
-      reason: `已经超过 ${Math.round(windowMs / 3_600_000)} 小时，不能再从卡片删除；请手工编辑 kb/kb.feishu.yaml`,
+      reason: `已超过 ${Math.round(windowMs / 3_600_000)} 小时，不能再从卡片删除，请手工编辑 kb/kb.feishu.yaml`,
     };
   }
   return { ok: true, entry };
