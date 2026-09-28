@@ -9,6 +9,12 @@ RUN npm run build && npm prune --omit=dev
 FROM node:24-slim@sha256:2fe369e969550cde8e867afc3fe370b260140cab4a23d467074295b42163d553
 WORKDIR /app
 ENV NODE_ENV=production
+# git 只给「正式知识库（kb.yaml）卡片改动后自动提交」用：容器里跑 git commit，
+# work-tree 就是 /app，宿主仓库的 .git 由 compose 挂到 /app/.git（见 docker-compose.yml）。
+# --no-install-recommends 避免拖进一堆用不上的东西；装完立刻清 apt 缓存。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./

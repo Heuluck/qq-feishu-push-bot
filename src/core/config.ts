@@ -132,6 +132,8 @@ const EnvSchema = z.object({
   KB_FEISHU_PATH: z.string().trim().min(1).default("kb/kb.feishu.yaml"),
   /** 卡片上删掉的条目归档到这里，只增不改；程序不会自动恢复。 */
   KB_FEISHU_TRASH_PATH: z.string().trim().min(1).default("kb/kb.feishu.trash.yaml"),
+  /** 正式知识库（kb.yaml）里从卡片上删掉的条目归档到这里，只增不改；程序不会自动恢复。 */
+  KB_TRASH_PATH: z.string().trim().min(1).default("kb/kb.trash.yaml"),
   /** 是否在飞书群里开知识库管理菜单（需要开发者后台配好长连接的事件与回调订阅）。 */
   KB_ADMIN_ENABLED: z
     .enum(["true", "false"])
@@ -148,6 +150,31 @@ const EnvSchema = z.object({
   KB_MAX_PROMPT_CHARS: z.coerce.number().int().min(1_000).max(200_000).default(8_000),
   /** 卡片上那条「删除」按钮的有效期（小时）。 */
   KB_DELETE_WINDOW_HOURS: z.coerce.number().int().min(1).max(720).default(24),
+
+  // 正式知识库（kb.yaml）的 git 留痕
+  /**
+   * 卡片改动 kb.yaml 后是否自动 git commit。
+   *
+   * 需要容器能访问一个 git 仓库（compose 把仓库根挂到 /repo，并把 KB_GIT_REPO 指过去）
+   * 且镜像里有 git。仓库缺失时提交失败只记日志、不影响改动本身（文件已写盘并热重载）。
+   */
+  KB_GIT_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+  /** 仓库根目录；git 命令在这里执行（容器内默认挂在 /repo，本机开发是当前目录）。 */
+  KB_GIT_REPO: z.string().trim().min(1).default("."),
+  /** 提交后是否推送。预留能力：默认关闭，配好远端与凭据再打开。 */
+  KB_GIT_PUSH: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  /** push 用的远端名。 */
+  KB_GIT_REMOTE: z.string().trim().min(1).default("origin"),
+  /** 提交者身份。容器里通常没有全局 git 配置，所以每条命令显式带上。 */
+  KB_GIT_AUTHOR_NAME: z.string().trim().min(1).default("kb-bot"),
+  KB_GIT_AUTHOR_EMAIL: z.string().trim().min(1).default("kb-bot@localhost"),
+
   DATA_DIR: z.string().trim().min(1).default("data"),
   /** 数据文件（转交留档/调试转储/配额归档）的保留天数。 */
   DATA_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(30),

@@ -4,12 +4,15 @@
  * 覆盖知识库编译、工具 schema/校验、图片缩放、回复拆分这几条纯逻辑。
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import sharp from "sharp";
 import type { Config } from "./core/config.js";
 import { stripMentions, truncateText } from "./core/text.js";
 import { loadKnowledgeBase, compileKnowledgeBase } from "./kb/kb.js";
-import type { FeishuKbEntry } from "./kb/kb.js";
+import type { FeishuKbEntry, KbEntry } from "./kb/kb.js";
+import { BaseKbStore } from "./kb/base.js";
+import { commitPaths } from "./kb/git.js";
 import {
   FeishuKbStore,
   checkDeletable,
@@ -23,15 +26,23 @@ import type { FeishuLayerFile } from "./kb/feishu.js";
 import { parseAdminIds } from "./lark/admin.js";
 import {
   EMPTY_DRAFT,
+  MAX_COMMIT_MSG_CHARS,
   OP,
   buildAddedCard,
+  buildBaseAddConfirmCard,
+  buildBaseAddedCard,
+  buildBaseDeleteConfirmCard,
+  buildBaseListCard,
+  buildBaseMenuCard,
   buildEntryListCard,
   buildMenuCard,
   buildStep1Card,
   buildStep2Card,
   buildToggleResultCard,
+  commitMessageFrom,
   draftFromValue,
   draftValue,
+  layerFromValue,
   mergeDraft,
 } from "./lark/kbCards.js";
 import type { Card, KbState, WizardDraft } from "./lark/kbCards.js";
@@ -1575,6 +1586,190 @@ check(
 const aclMixed = parseAdminIds("ou_a,*", "oc_group");
 check("名单：混写时以 * 为准（并有 ou_a 也在名单里）", aclMixed.wildcard && aclMixed.ids.has("ou_a"));
 rmSync(storeRoot, { recursive: true, force: true });
+
+// 20. 正式知识库（kb.yaml）卡片：红色入口 + 二次确认 + 提交说明
+const baseMenuOps = collectActions(buildBaseMenuCard(state, identitySign));
+check(
+  "正式库菜单：新增/查看入口齐全",
+  ["kb.base.add", "kb.base.list"].every((op) => baseMenuOps.some((value) => value["op"] === op)),
+);
+check("正式库菜单：红色标题（一眼看出是直接改主文件）", JSON.stringify(buildBaseMenuCard(state, identitySign)).includes('"red"'));
+check(
+  "主菜单：新增一个红色危险入口，回传 kb.base.menu",
+  collectActions(buildMenuCard(state, identitySign)).some((value) => value["op"] === "kb.base.menu") &&
+    JSON.stringify(buildMenuCard(state, identitySign)).includes('"danger"'),
+);
+check(
+  "正式库向导第一步：带 base 层标记，标题也变了",
+  collectActions(buildStep1Card(identitySign, EMPTY_DRAFT, "base")).some(
+    (value) => value["op"] === "kb.wizard.next" && value["layer"] === "base",
+  ) && JSON.stringify(buildStep1Card(identitySign, EMPTY_DRAFT, "base")).includes("新增正式条目 1/2"),
+);
+check("层标记：缺省回到 feishu，不会被伪造的 layer 带偏", layerFromValue({}) === "feishu" && layerFromValue({ layer: "base" }) === "base");
+
+const baseEntries: KbEntry[] = [
+  { id: "one", title: "一", keywords: ["a"], route: "answer", answer: "答案一" },
+  { id: "two", title: "二", keywords: ["b"], route: "forward", forward_hint: "找同学" },
+];
+const baseListCard = buildBaseListCard(state, baseEntries, identitySign);
+check(
+  "正式库列表：每条带删除入口（kb.base.remove）",
+  collectActions(baseListCard).some((value) => value["op"] === "kb.base.remove" && value["id"] === "one"),
+);
+check(
+  "正式库列表：不用客户端原生 confirm（要自己出一张卡收提交说明）",
+  !JSON.stringify(baseListCard).includes('"confirm"'),
+);
+check("正式库列表：说明删除会进回收站并由 git 留痕", JSON.stringify(baseListCard).includes("回收站") && JSON.stringify(baseListCard).includes("git"));
+
+const confirmDraft: WizardDraft = {
+  id: "new-one",
+  title: "新条目",
+  keywords: "甲,乙",
+  route: "answer",
+  answer: "答案正文",
+  forward_hint: "",
+};
+const addConfirm = buildBaseAddConfirmCard(confirmDraft, identitySign);
+check(
+  "正式库新增确认页：要求填提交说明（commit_msg）",
+  collectNames(addConfirm, "input").includes("commit_msg"),
+);
+check(
+  "正式库新增确认页：确认按钮带完整草稿与 base 层标记",
+  collectActions(addConfirm).some(
+    (value) =>
+      value["op"] === "kb.base.confirm" &&
+      value["layer"] === "base" &&
+      value["id"] === "new-one" &&
+      value["answer"] === "答案正文",
+  ),
+);
+check(
+  "正式库新增确认页：上一步回第二步（不是一路退回第一步）",
+  collectActions(addConfirm).some((value) => value["op"] === "kb.base.back" && value["id"] === "new-one"),
+);
+check(
+  "正式库新增确认页：提交说明故意不设前端必填（否则同表单里的「上一步」会被拦住）",
+  !JSON.stringify(addConfirm).includes('"required":true'),
+);
+const baseDeleteConfirm = buildBaseDeleteConfirmCard(baseEntries[0]!, identitySign);
+check(
+  "正式库删除确认页：展示条目、要求提交说明、确认按钮带 id",
+  JSON.stringify(baseDeleteConfirm).includes("one") &&
+    collectNames(baseDeleteConfirm, "input").includes("commit_msg") &&
+    collectActions(baseDeleteConfirm).some((value) => value["op"] === "kb.base.remove.confirm" && value["id"] === "one"),
+);
+check(
+  "正式库结果卡片：写入成功给出「查看条目」入口",
+  collectActions(buildBaseAddedCard(baseEntries[0]!, identitySign)).some((value) => value["op"] === "kb.base.list"),
+);
+
+check("提交说明：空说明拒绝", !commitMessageFrom({}).ok && !commitMessageFrom({ commit_msg: "   " }).ok);
+check(
+  "提交说明：拼上 chore(kb): 前缀",
+  (() => {
+    const result = commitMessageFrom({ commit_msg: "新增 XX 条目" });
+    return result.ok && result.message === "chore(kb): 新增 XX 条目";
+  })(),
+);
+check("提交说明：超长拒绝", !commitMessageFrom({ commit_msg: "甲".repeat(MAX_COMMIT_MSG_CHARS + 1) }).ok);
+
+// 21. 正式知识库落盘：改文档不走重新渲染，注释与变量表原样保留
+const baseRoot = "data/smoke-tmp/base-store";
+rmSync(baseRoot, { recursive: true, force: true });
+mkdirSync(join(baseRoot, "kb"), { recursive: true });
+const baseLayer = join(baseRoot, "kb", "kb.yaml");
+const baseTrash = join(baseRoot, "kb", "kb.trash.yaml");
+const seedRaw =
+  "# 头部注释：这份是正式库\n" +
+  "variables:\n  site: https://example.com/\n" +
+  "entries:\n" +
+  "  - id: one\n    title: 一\n    keywords: [a]\n    route: answer\n    answer: 见 {{site}}\n" +
+  "  - id: two\n    title: 二\n    keywords: [b]\n    route: forward\n    forward_hint: 找同学\n";
+writeFileSync(baseLayer, seedRaw);
+const baseStore = new BaseKbStore({ layer: baseLayer, trash: baseTrash, dataDir: join(baseRoot, "data") });
+
+const addedRaw = baseStore.addEntry(seedRaw, {
+  id: "three",
+  title: "三",
+  keywords: ["c"],
+  route: "answer",
+  answer: "第一行\n第二行",
+});
+check(
+  "正式库落盘：追加条目保留头部注释与变量表（不是重新渲染整份 YAML）",
+  addedRaw.includes("# 头部注释：这份是正式库") && addedRaw.includes("见 {{site}}"),
+);
+check(
+  "正式库落盘：追加后仍能编译（新条目进入提示词）",
+  compileKnowledgeBase(addedRaw, baseLayer, undefined, "kb/kb.feishu.yaml").entries.some((entry) => entry.id === "three"),
+);
+const removedRaw = baseStore.removeEntry(addedRaw, "one");
+check(
+  "正式库落盘：按 id 精确删除只动那一条",
+  removedRaw !== undefined &&
+    removedRaw.entry.id === "one" &&
+    !removedRaw.text.includes("id: one") &&
+    removedRaw.text.includes("id: three") &&
+    removedRaw.text.includes("# 头部注释"),
+);
+check("正式库落盘：删不存在的 id 返回 undefined", baseStore.removeEntry(addedRaw, "nope") === undefined);
+
+await baseStore.saveRaw(removedRaw!.text);
+check("正式库落盘：写入前先留存快照", existsSync(join(baseRoot, "data", "kb-snapshots")));
+const baseTrashId = await baseStore.trash(removedRaw!.entry, "ou_smoke");
+check(
+  "正式库回收站：id 带短 uuid，且文件头标明是正式库的回收站",
+  new RegExp("^one_[0-9a-f]{8}$").test(baseTrashId) &&
+    readFileSync(baseTrash, "utf8").includes("正式知识库回收站"),
+);
+await baseStore.audit({ action: "delete", layer: "base", id: "one", actor: "ou_smoke" });
+check(
+  "正式库审计：写进 kb-audit-YYYY-MM.jsonl（受保留策略管辖），且带 layer 标记",
+  FILE_PATTERNS.kbBaseAudit.test(`kb-audit-${monthKey()}.jsonl`) &&
+    readFileSync(join(baseRoot, "data", `kb-audit-${monthKey()}.jsonl`), "utf8").includes('"layer":"base"'),
+);
+
+// 22. git 留痕：提交信息原样落进历史，仓库外的路径被拒绝
+const gitRoot = join(baseRoot, "gitrepo");
+mkdirSync(gitRoot, { recursive: true });
+const git = (args: string[]): string =>
+  execFileSync(
+    "git",
+    ["-C", gitRoot, "-c", "user.name=smoke", "-c", "user.email=smoke@local", "-c", "commit.gpgsign=false", ...args],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  );
+git(["init"]);
+writeFileSync(join(gitRoot, "kb.yaml"), "entries:\n  - id: one\n    title: 一\n    keywords: [a]\n    route: answer\n    answer: a\n");
+git(["add", "--", "kb.yaml"]);
+git(["commit", "-m", "init", "--", "kb.yaml"]);
+writeFileSync(join(gitRoot, "kb.yaml"), "entries:\n  - id: one\n    title: 一改\n    keywords: [a]\n    route: answer\n    answer: a\n");
+const gitResult = await commitPaths({
+  repo: gitRoot,
+  paths: [join(gitRoot, "kb.yaml")],
+  message: "chore(kb): 改标题",
+  authorName: "kb-bot",
+  authorEmail: "kb-bot@localhost",
+  push: false,
+  remote: "origin",
+});
+check("git：提交成功", gitResult.ok, gitResult.ok ? "" : gitResult.reason);
+check(
+  "git：提交信息就是用户填的那句（前缀由服务端拼）",
+  git(["log", "-1", "--pretty=%s"]).trim() === "chore(kb): 改标题",
+);
+const gitOutside = await commitPaths({
+  repo: gitRoot,
+  paths: [join(baseRoot, "outside.yaml")],
+  message: "chore(kb): x",
+  authorName: "kb-bot",
+  authorEmail: "kb-bot@localhost",
+  push: false,
+  remote: "origin",
+});
+check("git：仓库外的路径被拒绝", !gitOutside.ok);
+rmSync(baseRoot, { recursive: true, force: true });
 
 console.log(failed === 0 ? "\n全部通过 ✅" : `\n有 ${failed} 项失败 ❌`);
 process.exitCode = failed === 0 ? 0 : 1;

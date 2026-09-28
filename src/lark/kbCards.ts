@@ -25,7 +25,7 @@
  * 转交提醒那套卡片在 `./cards.ts`，是 1.0，两套互不影响、也不互相更新。
  */
 import { ROUTE_LABEL } from "../kb/kb.js";
-import type { FeishuKbEntry } from "../kb/kb.js";
+import type { FeishuKbEntry, KbEntry } from "../kb/kb.js";
 
 export type Card = Record<string, unknown>;
 /** 把回传数据签好名再塞进按钮。 */
@@ -48,7 +48,31 @@ export const OP = {
   remove: "kb.remove",
   wizardNext: "kb.wizard.next",
   wizardBack: "kb.wizard.back",
+  /** 主菜单上的红色入口 → 正式知识库（kb.yaml）菜单。 */
+  baseMenu: "kb.base.menu",
+  baseList: "kb.base.list",
+  baseAdd: "kb.base.add",
+  baseBack: "kb.base.back",
+  baseConfirm: "kb.base.confirm",
+  baseRemove: "kb.base.remove",
+  baseRemoveConfirm: "kb.base.remove.confirm",
 } as const;
+
+/**
+ * 向导与卡片针对的知识库层。
+ *   - feishu：kb.feishu.yaml（原有的补充层）
+ *   - base  ：kb.yaml（正式库，改动要二次确认 + git 提交）
+ */
+export type Layer = "feishu" | "base";
+
+export function layerFromValue(payload: Record<string, unknown>): Layer {
+  return payload["layer"] === "base" ? "base" : "feishu";
+}
+
+/** 正式知识库的提交说明上限（会拼在 `chore(kb): ` 后面）。 */
+export const MAX_COMMIT_MSG_CHARS = 80;
+/** 自动生成的 commit 前缀。 */
+export const COMMIT_PREFIX = "chore(kb): ";
 
 export const ROUTES = ["answer", "forward", "answer_and_forward"] as const;
 export type Route = (typeof ROUTES)[number];
@@ -93,8 +117,13 @@ const DRAFT_KEYS: (keyof WizardDraft)[] = ["id", "title", "keywords", "route", "
  * **展平成顶层键**而不是塞成一个嵌套对象：`signActionValue` 只对顶层键排序做规范化，
  * 嵌套对象内部的键序依赖 JSON 往返是否原样保留——展平以后顺序完全确定，验签不会漂。
  */
-export function draftValue(sign: ActionSigner, op: string, draft: WizardDraft): Record<string, unknown> {
-  const payload: Record<string, unknown> = { op };
+export function draftValue(
+  sign: ActionSigner,
+  op: string,
+  draft: WizardDraft,
+  layer: Layer = "feishu",
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = { op, layer };
   for (const key of DRAFT_KEYS) payload[key] = draft[key];
   return sign(payload);
 }
@@ -301,12 +330,144 @@ export function buildMenuCard(state: KbState, sign: ActionSigner): Card {
       // 而服务端是按当前状态取反，写成状态词迟早会和实际状态对不上；「切换」又太容易被读成别的意思。
       button("飞书补充知识开关", "default", sign({ op: OP.toggle })),
     ]),
+    // 红色 = 直接改正式知识库（kb.yaml）。危险配色 + 进去后每步二次确认 + 回收站 + git 兜底。
+    buttons([button("正式知识库（kb.yaml）", "danger", sign({ op: OP.baseMenu }))]),
   ]);
 }
 
+// ── 正式知识库（kb.yaml）────────────────────────────────────────────────────
+
+/** 正式知识库的入口卡片。红色标题提醒这是直接改主文件、不是补充层。 */
+export function buildBaseMenuCard(state: KbState, sign: ActionSigner): Card {
+  return card({ title: "正式知识库（kb.yaml）", template: "red" }, [
+    md(stateLines(state)),
+    md("这里的增删都会**二次确认**、删除进回收站，并自动 git 提交（`chore(kb): <你填的说明>`）"),
+    hr(),
+    buttons([
+      button("新增条目", "primary", sign({ op: OP.baseAdd })),
+      button("查看条目（可删）", "danger", sign({ op: OP.baseList })),
+    ]),
+  ]);
+}
+
+/** 正式条目的列表：一条一个折叠面板，面板里带删除入口。 */
+export function buildBaseListCard(state: KbState, entries: KbEntry[], sign: ActionSigner): Card {
+  const elements: unknown[] = [md(stateLines(state)), hr()];
+  if (entries.length === 0) {
+    elements.push(md("正式知识库为空"));
+  } else {
+    const budget = entries.length > 20 ? 120 : 300;
+    for (const entry of entries) {
+      const lines = [`**处理方式**　${ROUTE_LABEL[entry.route]}\n**关键词**　${entry.keywords.join("、")}`];
+      if (entry.answer) lines.push(`**答案**\n${truncate(entry.answer, budget)}`);
+      if (entry.forward_hint) lines.push(`**转交说明**\n${truncate(entry.forward_hint, budget)}`);
+      elements.push(
+        panel(`\`${entry.id}\`　${entry.title}`, [
+          ...lines.map((line) => md(line)),
+          // 这里不用客户端原生 confirm：下一步要收「提交说明」，必须自己出一张卡。
+          button("删除", "danger", sign({ op: OP.baseRemove, id: entry.id })),
+        ]),
+      );
+    }
+  }
+  elements.push(md("删除前会再确认一次并要求填写提交说明；删掉的条目进回收站（`kb/kb.trash.yaml`），并由 git 留痕"));
+  return card({ title: `正式知识库（${entries.length} 条）`, template: "red" }, elements);
+}
+
+/** 正式条目向导的第二步（确认页）：展示草稿 + 要求填写提交说明。 */
+export function buildBaseAddConfirmCard(draft: WizardDraft, sign: ActionSigner): Card {
+  const askAnswer = draft.route === "answer" || draft.route === "answer_and_forward";
+  const askForward = draft.route === "forward" || draft.route === "answer_and_forward";
+  const lines = [
+    `**id**　\`${draft.id.trim()}\``,
+    `**标题**　${draft.title.trim()}`,
+    `**关键词**　${formatKeywords(draft.keywords)}`,
+    `**处理方式**　${routeLabel(draft.route)}`,
+  ];
+  if (askAnswer && draft.answer.trim() !== "") lines.push(`**答案**\n${truncate(draft.answer.trim(), 600)}`);
+  if (askForward && draft.forward_hint.trim() !== "") {
+    lines.push(`**转交说明**\n${truncate(draft.forward_hint.trim(), 400)}`);
+  }
+  return card({ title: "新增正式条目 · 确认", template: "red" }, [
+    md(lines.join("\n")),
+    hr(),
+    md(`确认后写入 \`kb/kb.yaml\`、热重载并提交：\n\`${COMMIT_PREFIX}<提交说明>\``),
+    {
+      tag: "form",
+      name: "kb_base_add_confirm",
+      elements: [
+        // 故意不设 required：这张表单里还有「上一步」这个提交按钮，设了必填用户就退不回去
+        // （会先被「有必填项未填写」拦住）。空说明由服务端拦截，只弹 toast、不更新卡片。
+        inputField("commit_msg", "提交说明", {
+          max: MAX_COMMIT_MSG_CHARS,
+          placeholder: "如：新增 XX 条目",
+        }),
+        buttons([
+          submitButton("确认写入", "danger", "kb_base_confirm", draftValue(sign, OP.baseConfirm, draft, "base")),
+          submitButton("上一步", "default", "kb_base_back", draftValue(sign, OP.baseBack, draft, "base")),
+        ]),
+      ],
+    },
+  ]);
+}
+
+/** 删除正式条目的确认页：展示该条 + 要求填写提交说明。 */
+export function buildBaseDeleteConfirmCard(entry: KbEntry, sign: ActionSigner): Card {
+  const lines = [
+    `**id**　\`${entry.id}\``,
+    `**标题**　${entry.title}`,
+    `**处理方式**　${ROUTE_LABEL[entry.route]}\n**关键词**　${entry.keywords.join("、")}`,
+  ];
+  if (entry.answer) lines.push(`**答案**\n${truncate(entry.answer, 400)}`);
+  if (entry.forward_hint) lines.push(`**转交说明**\n${truncate(entry.forward_hint, 300)}`);
+  return card({ title: "删除正式条目 · 确认", template: "red" }, [
+    md(lines.join("\n")),
+    hr(),
+    md(`确认后从 \`kb/kb.yaml\` 删除、归档进 \`kb/kb.trash.yaml\` 并提交：\n\`${COMMIT_PREFIX}<提交说明>\``),
+    {
+      tag: "form",
+      name: "kb_base_delete_confirm",
+      elements: [
+        inputField("commit_msg", "提交说明", {
+          required: true,
+          max: MAX_COMMIT_MSG_CHARS,
+          placeholder: "如：删除过期的 XX 条目",
+        }),
+        buttons([submitButton("确认删除", "danger", "kb_base_delete", sign({ op: OP.baseRemoveConfirm, id: entry.id }))]),
+      ],
+    },
+  ]);
+}
+
+/** 正式条目新增成功后的结果卡片，带一个能直接去看列表的按钮。 */
+export function buildBaseAddedCard(entry: KbEntry, sign: ActionSigner): Card {
+  return card({ title: `已写入正式知识库：${entry.title}`, template: "green" }, [
+    md(`id \`${entry.id}\` 已写入 \`kb/kb.yaml\`，下一次提问即生效`),
+    buttons([button("查看条目", "default", sign({ op: OP.baseList }))]),
+  ]);
+}
+
+/**
+ * 把确认页表单里的提交说明拼成完整 commit message。
+ * 空说明直接拒绝——提交信息是这一整套「改动可追溯」的核心，不能留默认值。
+ */
+export function commitMessageFrom(form: Record<string, unknown>): { ok: true; message: string } | { ok: false; reason: string } {
+  const raw = typeof form["commit_msg"] === "string" ? form["commit_msg"].trim() : "";
+  if (raw === "") return { ok: false, reason: "请填写提交说明" };
+  if (raw.length > MAX_COMMIT_MSG_CHARS) {
+    return { ok: false, reason: `提交说明不能超过 ${MAX_COMMIT_MSG_CHARS} 字` };
+  }
+  return { ok: true, message: `${COMMIT_PREFIX}${raw}` };
+}
+
 /** 第一步：基本信息 + 处理方式。点「下一步」时才决定第二步要填哪个框。 */
-export function buildStep1Card(sign: ActionSigner, draft: WizardDraft): Card {
-  return card({ title: "新增飞书补充知识 1/2", template: "turquoise" }, [
+export function buildStep1Card(sign: ActionSigner, draft: WizardDraft, layer: Layer = "feishu"): Card {
+  const title = layer === "base" ? "新增正式条目 1/2" : "新增飞书补充知识 1/2";
+  const footer =
+    layer === "base"
+      ? `写进 \`kb/kb.yaml\`，最后还要确认一次并填写提交说明；已存在的 id 不能重复`
+      : `id 全局唯一，只能用字母、数字、下划线、短横线（≤ ${MAX_ID_CHARS} 字）`;
+  return card({ title, template: layer === "base" ? "red" : "turquoise" }, [
     {
       tag: "form",
       name: "kb_step1",
@@ -314,7 +475,7 @@ export function buildStep1Card(sign: ActionSigner, draft: WizardDraft): Card {
         inputField("id", "id", {
           required: true,
           max: MAX_ID_CHARS,
-          placeholder: "如 feishu-jwpt-phone",
+          placeholder: layer === "base" ? "如 app-download-tip" : "如 feishu-jwpt-phone",
           value: draft.id,
         }),
         inputField("title", "标题", {
@@ -333,13 +494,10 @@ export function buildStep1Card(sign: ActionSigner, draft: WizardDraft): Card {
         // 这也是官方表单示例里的写法。
         md("**处理方式**"),
         routeSelect(draft),
-        buttons([submitButton("下一步", "primary_filled", "kb_next", draftValue(sign, OP.wizardNext, draft))]),
+        buttons([submitButton("下一步", "primary_filled", "kb_next", draftValue(sign, OP.wizardNext, draft, layer))]),
       ],
     },
-    md(
-      `id 全局唯一，只能用字母、数字、下划线、短横线（≤ ${MAX_ID_CHARS} 字）；` +
-        `标题 ≤ ${MAX_TITLE_CHARS} 字；关键词用逗号分隔、合计 ≤ ${MAX_KEYWORDS_CHARS} 字`,
-    ),
+    md(`${footer}；标题 ≤ ${MAX_TITLE_CHARS} 字；关键词用逗号分隔、合计 ≤ ${MAX_KEYWORDS_CHARS} 字`),
   ]);
 }
 
@@ -348,7 +506,7 @@ export function buildStep1Card(sign: ActionSigner, draft: WizardDraft): Card {
  * （不做成 disabled 输入框：那需要客户端 V7.4+，而且「disabled 的输入框会不会随
  * form_value 一起提交」文档没写清楚——权威值本来就在按钮的签名值里，展示用文本最省事）。
  */
-export function buildStep2Card(draft: WizardDraft, sign: ActionSigner): Card {
+export function buildStep2Card(draft: WizardDraft, sign: ActionSigner, layer: Layer = "feishu"): Card {
   const askAnswer = draft.route === "answer" || draft.route === "answer_and_forward";
   const askForward = draft.route === "forward" || draft.route === "answer_and_forward";
   const fields: unknown[] = [];
@@ -373,7 +531,7 @@ export function buildStep2Card(draft: WizardDraft, sign: ActionSigner): Card {
     );
   }
 
-  return card({ title: "新增飞书补充知识 2/2", template: "turquoise" }, [
+  return card({ title: layer === "base" ? "新增正式条目 2/2" : "新增飞书补充知识 2/2", template: layer === "base" ? "red" : "turquoise" }, [
     md(
       [
         `**id**　\`${draft.id}\``,
@@ -392,8 +550,8 @@ export function buildStep2Card(draft: WizardDraft, sign: ActionSigner): Card {
       elements: [
         ...fields,
         buttons([
-          submitButton("提交", "primary_filled", "kb_submit", draftValue(sign, OP.submit, draft)),
-          submitButton("上一步", "default", "kb_back", draftValue(sign, OP.wizardBack, draft)),
+          submitButton("提交", "primary_filled", "kb_submit", draftValue(sign, OP.submit, draft, layer)),
+          submitButton("上一步", "default", "kb_back", draftValue(sign, OP.wizardBack, draft, layer)),
         ]),
       ],
     },

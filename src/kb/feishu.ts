@@ -51,8 +51,8 @@ export function trashIdOf(originalId: string): string {
 }
 
 /** 渲染回收站文件（只增不改，所以是整体重写，但仍然走原子替换）。 */
-export function renderTrashFileText(records: Record<string, unknown>[]): string {
-  return `${TRASH_HEADER}\n\n${stringifyYaml({ deleted: records }, { lineWidth: 0 })}`;
+export function renderTrashFileText(records: Record<string, unknown>[], header: string = TRASH_HEADER): string {
+  return `${header}\n\n${stringifyYaml({ deleted: records }, { lineWidth: 0 })}`;
 }
 
 /**
@@ -173,6 +173,8 @@ async function atomicWrite(path: string, text: string): Promise<void> {
   await writeFile(tmp, text, "utf8");
   await rename(tmp, path);
 }
+
+export { atomicWrite };
 
 /**
  * 能不能从卡片上删掉这一条。抽成纯函数是因为这是整个功能里最要紧的一条规则，

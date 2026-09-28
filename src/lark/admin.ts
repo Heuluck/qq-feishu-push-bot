@@ -19,7 +19,11 @@ import type { Config } from "../core/config.js";
 import { larkLogger, log } from "../core/log.js";
 import { FeishuKbStore, checkDeletable, renderFeishuFileText, signActionValue, verifyActionValue } from "../kb/feishu.js";
 import type { FeishuLayerFile } from "../kb/feishu.js";
-import { FeishuEntrySchema, compileKnowledgeBase } from "../kb/kb.js";
+import { BaseKbStore } from "../kb/base.js";
+import { commitPaths } from "../kb/git.js";
+import type { GitCommitResult } from "../kb/git.js";
+import { BaseEntrySchema, FeishuEntrySchema, compileKnowledgeBase } from "../kb/kb.js";
+import type { KbEntry } from "../kb/kb.js";
 import type { KnowledgeBaseRuntime } from "../kb/runtime.js";
 import {
   EMPTY_DRAFT,
@@ -30,6 +34,11 @@ import {
   MAX_TITLE_CHARS,
   OP,
   buildAddedCard,
+  buildBaseAddConfirmCard,
+  buildBaseAddedCard,
+  buildBaseDeleteConfirmCard,
+  buildBaseListCard,
+  buildBaseMenuCard,
   buildDeletedCard,
   buildEntryListCard,
   buildMenuCard,
@@ -38,8 +47,10 @@ import {
   buildStep2Card,
   buildSubmittedCard,
   buildToggleResultCard,
+  commitMessageFrom,
   draftFromValue,
   isRoute,
+  layerFromValue,
   mergeDraft,
 } from "./kbCards.js";
 import type { Card, KbState, WizardDraft } from "./kbCards.js";
@@ -129,6 +140,7 @@ export class LarkKbAdmin {
   private readonly client: Lark.Client;
   private readonly ws: Lark.WSClient;
   private readonly store: FeishuKbStore;
+  private readonly baseStore: BaseKbStore;
   private readonly acl: AdminAcl;
   private chatId: string | undefined;
   /** 最近一次发出的主菜单消息 id。卡片内容变了就靠它原地刷新（`message.patch`）。 */
@@ -157,6 +169,11 @@ export class LarkKbAdmin {
       trash: cfg.KB_FEISHU_TRASH_PATH,
       dataDir: cfg.DATA_DIR,
     });
+    this.baseStore = new BaseKbStore({
+      layer: cfg.KB_PATH,
+      trash: cfg.KB_TRASH_PATH,
+      dataDir: cfg.DATA_DIR,
+    });
     this.acl = parseAdminIds(cfg.LARK_ADMIN_OPEN_IDS, cfg.LARK_FEEDBACK_CHAT_ID ?? "");
   }
 
@@ -182,6 +199,16 @@ export class LarkKbAdmin {
       );
     } else {
       log.info("kb-admin", `知识库管理员 ${this.acl.ids.size} 人，操作群 ${chatId}`);
+    }
+
+    if (this.cfg.KB_GIT_ENABLED) {
+      log.info(
+        "kb-admin",
+        `正式知识库（${this.cfg.KB_PATH}）改完会 git 提交：仓库 ${this.cfg.KB_GIT_REPO}` +
+          `${this.cfg.KB_GIT_PUSH ? `，并推送到 ${this.cfg.KB_GIT_REMOTE}` : "（未开启推送）"}`,
+      );
+    } else {
+      log.warn("kb-admin", "KB_GIT_ENABLED=false：正式知识库改动不会 git 提交");
     }
 
     await this.logChatMode();
@@ -306,6 +333,20 @@ export class LarkKbAdmin {
           return await this.onDelete(openId, verified.payload, messageId);
         case OP.remove:
           return await this.onRemove(openId, verified.payload, messageId);
+        case OP.baseMenu:
+          return await this.onBaseMenu(messageId);
+        case OP.baseList:
+          return await this.onBaseList(messageId);
+        case OP.baseAdd:
+          return await this.onBaseAdd(messageId);
+        case OP.baseBack:
+          return await this.onBaseBack(verified.payload, data.action?.form_value ?? {});
+        case OP.baseConfirm:
+          return await this.onBaseConfirm(openId, verified.payload, data.action?.form_value ?? {}, messageId);
+        case OP.baseRemove:
+          return await this.onBaseRemove(verified.payload, messageId);
+        case OP.baseRemoveConfirm:
+          return await this.onBaseRemoveConfirm(openId, verified.payload, data.action?.form_value ?? {}, messageId);
         default:
           return toast("warning", `未知操作：${op === "" ? "(空)" : op}`);
       }
@@ -332,7 +373,7 @@ export class LarkKbAdmin {
     const draft = mergeDraft(draftFromValue(payload), form);
     const problem = this.checkStep1(draft);
     if (problem !== "") return toast("error", problem);
-    return cardOnly(buildStep2Card(draft, this.sign));
+    return cardOnly(buildStep2Card(draft, this.sign, layerFromValue(payload)));
   }
 
   /**
@@ -343,7 +384,7 @@ export class LarkKbAdmin {
    */
   private async onWizardBack(payload: Record<string, unknown>, form: Record<string, unknown>): Promise<CallbackResponse> {
     const draft = mergeDraft(draftFromValue(payload), form);
-    return cardOnly(buildStep1Card(this.sign, draft));
+    return cardOnly(buildStep1Card(this.sign, draft, layerFromValue(payload)));
   }
 
   /** 查看补充条目。 */
@@ -462,6 +503,11 @@ export class LarkKbAdmin {
     const problem = this.checkStep1(draft);
     if (problem !== "") return toast("error", problem);
 
+    // 正式知识库：这一步只到「确认页」，真正的写入在 onBaseConfirm（那一页要填提交说明）。
+    if (layerFromValue(payload) === "base") {
+      return cardOnly(buildBaseAddConfirmCard(draft, this.sign));
+    }
+
     const text = (value: string): string => value.trim();
     const candidate = {
       id: text(draft.id),
@@ -516,6 +562,216 @@ export class LarkKbAdmin {
     void this.refreshMenu();
     void this.replyCard(messageId, buildAddedCard(entry, this.sign), { inThread: true });
     return toastWithCard("success", `已新增「${entry.title}」`, buildSubmittedCard(entry));
+  }
+
+  // ── 正式知识库（kb.yaml）：红色入口 + 二次确认 + 回收站 + git ──────────────────
+
+  private async onBaseMenu(messageId: string): Promise<CallbackResponse> {
+    await this.replyCard(messageId, buildBaseMenuCard(this.state(), this.sign), { inThread: true });
+    return toast("info", "已发到下方话题");
+  }
+
+  private async onBaseList(messageId: string): Promise<CallbackResponse> {
+    await this.replyCard(
+      messageId,
+      buildBaseListCard(this.state(), this.kb.current().entries, this.sign),
+      { inThread: true },
+    );
+    return toast("info", "已发到下方话题");
+  }
+
+  private async onBaseAdd(messageId: string): Promise<CallbackResponse> {
+    await this.replyCard(messageId, buildStep1Card(this.sign, EMPTY_DRAFT, "base"), { inThread: true });
+    return toast("info", "已发到下方话题");
+  }
+
+  /** 确认页 → 上一步：回到第二步（答案 / 转交说明），而不是一路退回第一步。 */
+  private async onBaseBack(payload: Record<string, unknown>, form: Record<string, unknown>): Promise<CallbackResponse> {
+    const draft = mergeDraft(draftFromValue(payload), form);
+    return cardOnly(buildStep2Card(draft, this.sign, "base"));
+  }
+
+  /**
+   * 正式条目确认写入。到这里才真正改文件：
+   * 校验 → 试编译 → 写盘 → 热重载 → git 提交 → 审计。
+   * git 失败只提示、不回滚：文件已生效，历史可以事后补。
+   */
+  private async onBaseConfirm(
+    openId: string,
+    payload: Record<string, unknown>,
+    form: Record<string, unknown>,
+    messageId: string,
+  ): Promise<CallbackResponse> {
+    const draft = mergeDraft(draftFromValue(payload), form);
+    const problem = this.checkStep1(draft);
+    if (problem !== "") return toast("error", problem);
+
+    const made = this.draftToBaseEntry(draft);
+    if (!made.ok) return toast("error", made.reason);
+
+    const commit = commitMessageFrom(form);
+    if (!commit.ok) return toast("error", commit.reason);
+
+    const raw = await this.baseStore.readRaw();
+    let nextRaw: string;
+    try {
+      nextRaw = this.baseStore.addEntry(raw, made.entry);
+    } catch (err) {
+      return toast("error", `无法写入 ${this.cfg.KB_PATH}：${errorText(err)}`);
+    }
+    // id 撞车、变量没定义、总量超限都在这里拦下（和启动时同一个编译器）。
+    const compileProblem = await this.tryCompileBase(nextRaw);
+    if (compileProblem !== "") return toast("error", compileProblem);
+
+    await this.baseStore.saveRaw(nextRaw);
+    await this.kb.reload();
+    const git = await this.commitBase(commit.message);
+    await this.baseStore.audit({
+      action: "add",
+      layer: "base",
+      id: made.entry.id,
+      title: made.entry.title,
+      route: made.entry.route,
+      keywords: made.entry.keywords,
+      actor: openId,
+      source_message: messageId,
+      commit: commit.message,
+      git: !this.cfg.KB_GIT_ENABLED ? "disabled" : git.ok ? (git.pushed ? "ok+pushed" : "ok") : git.reason,
+    });
+
+    log.info("kb-admin", `正式知识库新增：${made.entry.id}（${made.entry.title}），操作者 ${openId}`);
+    void this.refreshMenu();
+    return toastWithCard(
+      "success",
+      this.withGitNote(`已写入「${made.entry.title}」`, git),
+      buildBaseAddedCard(made.entry, this.sign),
+    );
+  }
+
+  /** 列表里点「删除」→ 先把确认页发进话题（要填提交说明，所以不能只靠客户端原生 confirm）。 */
+  private async onBaseRemove(payload: Record<string, unknown>, messageId: string): Promise<CallbackResponse> {
+    const id = typeof payload["id"] === "string" ? payload["id"] : "";
+    if (id === "") return toast("error", "缺少条目 id");
+    const entry = this.kb.current().entries.find((item) => item.id === id);
+    if (entry === undefined) return toast("error", `id「${id}」已不存在（可能刚被删掉）`);
+    await this.replyCard(messageId, buildBaseDeleteConfirmCard(entry, this.sign), { inThread: true });
+    return toast("info", "已发到下方话题，确认后才会删除");
+  }
+
+  /** 删除确认：先归档进回收站，再改 kb.yaml，最后热重载 + git 提交。 */
+  private async onBaseRemoveConfirm(
+    openId: string,
+    payload: Record<string, unknown>,
+    form: Record<string, unknown>,
+    messageId: string,
+  ): Promise<CallbackResponse> {
+    const id = typeof payload["id"] === "string" ? payload["id"] : "";
+    if (id === "") return toast("error", "缺少条目 id");
+    const commit = commitMessageFrom(form);
+    if (!commit.ok) return toast("error", commit.reason);
+
+    const raw = await this.baseStore.readRaw();
+    const removed = this.baseStore.removeEntry(raw, id);
+    if (removed === undefined) return toast("error", `id「${id}」已不存在（可能刚被删掉）`);
+    // 删到一条不剩会被编译器的 .min(1) 拦下，这里原样把原因交给用户。
+    const compileProblem = await this.tryCompileBase(removed.text);
+    if (compileProblem !== "") return toast("error", compileProblem);
+
+    // 先写回收站，再改主文件：反过来的话中间挂掉就丢内容了。
+    const trashId = await this.baseStore.trash(removed.entry, openId);
+    await this.baseStore.saveRaw(removed.text);
+    await this.kb.reload();
+    const git = await this.commitBase(commit.message);
+    await this.baseStore.audit({
+      action: "delete",
+      layer: "base",
+      id: removed.entry.id,
+      title: removed.entry.title,
+      route: removed.entry.route,
+      actor: openId,
+      trash_id: trashId,
+      source_message: messageId,
+      commit: commit.message,
+      git: !this.cfg.KB_GIT_ENABLED ? "disabled" : git.ok ? (git.pushed ? "ok+pushed" : "ok") : git.reason,
+    });
+    log.info(
+      "kb-admin",
+      `正式知识库删除：${removed.entry.id}（${removed.entry.title}）→ 回收站 ${trashId}，操作者 ${openId}`,
+    );
+
+    void this.refreshMenu();
+    // 原地把确认页换成刷新后的列表：被删那行消失，不用再手动重开。
+    return toastWithCard(
+      "success",
+      this.withGitNote(`已删除「${removed.entry.title}」，回收站 id ${trashId}`, git),
+      buildBaseListCard(this.state(), this.kb.current().entries, this.sign),
+    );
+  }
+
+  /** 把向导草稿按正式条目的 schema 校验成一条 KbEntry（会丢掉卡片不该写的多余字段）。 */
+  private draftToBaseEntry(draft: WizardDraft): { ok: true; entry: KbEntry } | { ok: false; reason: string } {
+    const text = (value: string): string => value.trim();
+    const candidate = {
+      id: text(draft.id),
+      title: text(draft.title),
+      keywords: text(draft.keywords)
+        .split(/[,，]/)
+        .map((item) => item.trim())
+        .filter((item) => item !== ""),
+      route: text(draft.route),
+      answer: text(draft.answer) === "" ? undefined : text(draft.answer),
+      forward_hint: text(draft.forward_hint) === "" ? undefined : text(draft.forward_hint),
+    };
+    const parsed = BaseEntrySchema.safeParse(candidate);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      return { ok: false, reason: `校验失败：${issue ? issue.message : "未知原因"}` };
+    }
+    const tooLong = this.checkLengths(parsed.data);
+    if (tooLong !== "") return { ok: false, reason: tooLong };
+    return { ok: true, entry: parsed.data };
+  }
+
+  /** 写盘前用真正的编译器试一遍候选的 kb.yaml（id 撞车、变量引用、总量超限都会在这里现原形）。 */
+  private async tryCompileBase(candidate: string): Promise<string> {
+    try {
+      const compiled = compileKnowledgeBase(
+        candidate,
+        this.cfg.KB_PATH,
+        await this.kb.feishuRaw(),
+        this.cfg.KB_FEISHU_PATH,
+      );
+      if (compiled.systemPrompt.length > this.cfg.KB_MAX_PROMPT_CHARS) {
+        return `提示词已达 ${compiled.systemPrompt.length} 字，超过上限 ${this.cfg.KB_MAX_PROMPT_CHARS}，请精简`;
+      }
+      return "";
+    } catch (err) {
+      return errorText(err);
+    }
+  }
+
+  /** 提交正式知识库。失败只记日志、返回原因，绝不抛错。 */
+  private async commitBase(message: string): Promise<GitCommitResult> {
+    if (!this.cfg.KB_GIT_ENABLED) return { ok: true, pushed: false };
+    const result = await commitPaths({
+      repo: this.cfg.KB_GIT_REPO,
+      paths: [this.cfg.KB_PATH],
+      message,
+      authorName: this.cfg.KB_GIT_AUTHOR_NAME,
+      authorEmail: this.cfg.KB_GIT_AUTHOR_EMAIL,
+      push: this.cfg.KB_GIT_PUSH,
+      remote: this.cfg.KB_GIT_REMOTE,
+    });
+    if (result.ok) {
+      log.info("kb-admin", `正式知识库已提交：${message}${result.pushed ? "（已推送）" : ""}`);
+    } else {
+      log.warn("kb-admin", `正式知识库 git 提交失败：${result.reason}`);
+    }
+    return result;
+  }
+
+  private withGitNote(message: string, git: GitCommitResult): string {
+    return git.ok ? message : `${message}（git 提交失败：${git.reason}）`;
   }
 
   /**

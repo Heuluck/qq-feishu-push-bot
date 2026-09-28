@@ -13,3 +13,7 @@ deploy.sh
 # 不该跟着仓库走（deploy.sh 的 tar 也把它排除了，不会拿本机的试验内容覆盖线上）。
 kb/kb.feishu.yaml
 kb/kb.feishu.trash.yaml
+
+# 正式知识库（kb.yaml）由卡片直接改并 git 提交，会跟着仓库走；但它的回收站只增不改，
+# 属于运行期归档，和 kb.yaml 本身不同——不提交（deploy.sh 的 tar 也排除）。
+kb/kb.trash.yaml

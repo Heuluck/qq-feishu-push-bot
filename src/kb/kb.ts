@@ -42,6 +42,8 @@ const FeishuEntrySchema = FeishuEntryObjectSchema.refine(answerRequired, ANSWER_
 
 /** 未 refine 的对象 schema：回收站那类"再扩几个字段"的地方要拿它 `.extend()`。 */
 export { FeishuEntryObjectSchema, FeishuEntrySchema };
+/** 基线条目 schema：卡片往 kb.yaml 写条目时用它校验（会丢掉卡片不该写的多余字段）。 */
+export { EntrySchema as BaseEntrySchema };
 
 export const ROUTE_LABEL: Record<"answer" | "forward" | "answer_and_forward", string> = {
   answer: "可直接回复",

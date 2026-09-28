@@ -43,6 +43,18 @@ export class KnowledgeBaseRuntime {
     return readFile(this.cfg.KB_PATH, "utf8");
   }
 
+  /**
+   * 拿到飞书层原文（不存在时 undefined）——改 kb.yaml 时要拿它一起试编译，
+   * 否则「改完自己没问题、和飞书层 id 撞车」这种冲突要到重启才暴露。
+   */
+  async feishuRaw(): Promise<string | undefined> {
+    try {
+      return await readFile(this.cfg.KB_FEISHU_PATH, "utf8");
+    } catch {
+      return undefined;
+    }
+  }
+
   current(): KnowledgeBase {
     if (this.kb === undefined) throw new Error("知识库尚未加载");
     return this.kb;

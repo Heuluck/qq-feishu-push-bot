@@ -9,6 +9,8 @@ import { log } from "../core/log.js";
  *   - forwards-YYYY-MM.jsonl     转交留档，按月切分
  *   - raw-events.<时间戳>.jsonl  调试转储，每次开启 debug 的会话一个文件
  *   - limits.YYYY-MM-DD.json     配额归档，每天一份（跨日时归档）
+ *   - kb-audit-YYYY-MM.jsonl     正式知识库（kb.yaml）卡片操作留档，按月切分
+ *   - kb-feishu-audit-YYYY-MM.jsonl  飞书补充知识卡片操作留档，按月切分
  *
  * 清理只在「启动时」和「每 6 小时」执行，不做定时删文件的常驻逻辑；
  * 只删除严格匹配上述模式的过期文件，绝不碰目录里的其他东西。
@@ -43,6 +45,8 @@ export const FILE_PATTERNS = {
   limitsArchive: /^limits\.\d{4}-\d{2}-\d{2}\.json$/,
   /** 飞书知识库管理的操作留档（谁、什么时候、加了/删了哪一条）。 */
   kbFeishuAudit: /^kb-feishu-audit-\d{4}-\d{2}\.jsonl$/,
+  /** 正式知识库（kb.yaml）的操作留档。 */
+  kbBaseAudit: /^kb-audit-\d{4}-\d{2}\.jsonl$/,
 };
 
 export interface PruneResult {
@@ -118,6 +122,7 @@ export class Maintenance {
       pruneByAge(this.dataDir, FILE_PATTERNS.rawEvents, maxAgeMs),
       pruneByAge(this.dataDir, FILE_PATTERNS.limitsArchive, maxAgeMs),
       pruneByAge(this.dataDir, FILE_PATTERNS.kbFeishuAudit, maxAgeMs),
+      pruneByAge(this.dataDir, FILE_PATTERNS.kbBaseAudit, maxAgeMs),
     ]);
     const deleted = results.flatMap((item) => item.deleted);
     if (deleted.length > 0) {
