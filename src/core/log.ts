@@ -8,12 +8,30 @@ export function setLogLevel(level: string): void {
   if (level === "debug" || level === "info" || level === "warn" || level === "error") minLevel = level;
 }
 
+/**
+ * 把可能来自用户/平台的文本压成单行，防日志注入。
+ *
+ * 换行转义成字面 `\n`、剥掉 ANSI 转义序列与控制字符：否则一条含换行、或带终端控制码的消息
+ * 就能在日志里伪造出额外的行、或把日志刷花。对象类 `extra` 走 `util.inspect` 本就带转义，
+ * 这里只处理会被原样拼进日志行的字符串。
+ */
+export function sanitizeLogText(text: string, max = 4_000): string {
+  const oneLine = text
+    .replace(/\u001b\[[0-9;]*[A-Za-z]/g, "")
+    .replace(/\u001b/g, "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\r\n\u2028\u2029]+/g, "\\n")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
+  return oneLine.length > max ? `${oneLine.slice(0, max)}…（日志过长，已截断）` : oneLine;
+}
+
 function emit(level: Level, tag: string, message: string, extra?: unknown): void {
   if (ORDER[level] < ORDER[minLevel]) return;
-  const line = `${new Date().toISOString()} [${level.toUpperCase()}] [${tag}] ${message}`;
+  const line = `${new Date().toISOString()} [${level.toUpperCase()}] [${tag}] ${sanitizeLogText(message)}`;
   const sink = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
   if (extra === undefined) sink(line);
-  else sink(line, extra);
+  else sink(line, typeof extra === "string" ? sanitizeLogText(extra) : extra);
 }
 
 export const log = {

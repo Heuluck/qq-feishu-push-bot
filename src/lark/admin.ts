@@ -14,17 +14,20 @@
  *
  * 全程走长连接（`WSClient`），进程依旧不监听任何端口。
  */
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import type { Config } from "../core/config.js";
 import { larkLogger, log } from "../core/log.js";
 import { FeishuKbStore, checkDeletable, renderFeishuFileText, signActionValue, verifyActionValue } from "../kb/feishu.js";
 import type { FeishuLayerFile } from "../kb/feishu.js";
 import { BaseKbStore } from "../kb/base.js";
-import { commitPaths } from "../kb/git.js";
+import { requestCommit } from "../kb/git.js";
 import type { GitCommitResult } from "../kb/git.js";
 import { BaseEntrySchema, FeishuEntrySchema, compileKnowledgeBase } from "../kb/kb.js";
 import type { KbEntry } from "../kb/kb.js";
 import type { KnowledgeBaseRuntime } from "../kb/runtime.js";
+import { createSerialQueue } from "../qq/queue.js";
 import {
   EMPTY_DRAFT,
   MAX_ANSWER_CHARS,
@@ -33,6 +36,8 @@ import {
   MAX_KEYWORDS_CHARS,
   MAX_TITLE_CHARS,
   OP,
+  STEP1_FIELDS,
+  STEP2_FIELDS,
   buildAddedCard,
   buildBaseAddConfirmCard,
   buildBaseAddedCard,
@@ -102,6 +107,8 @@ function errorText(err: unknown): string {
 
 /** 保留最近多少条消息 id / 回调 id，用来挡住飞书的重复推送。 */
 const SEEN_CAP = 5_000;
+/** 幂等记录保留多久：飞书重推通常很快，48 小时足够覆盖「重启后又被重放」的窗口。 */
+const SEEN_TTL_MS = 48 * 3_600_000;
 
 export interface AdminAcl {
   /** `*`：群里任何人都能操作。 */
@@ -147,8 +154,16 @@ export class LarkKbAdmin {
   private menuMessageId: string | undefined;
   /** 飞书不让更新这张卡片时置位，避免每次都白试一遍。 */
   private menuPatchable = true;
-  /** 幂等集合：飞书明说「特殊情况下可能重复推送」，且让用 message_id 去重而不是 event_id。 */
-  private readonly seen = new Set<string>();
+  /**
+   * 幂等簿记：飞书明说「特殊情况下可能重复推送」，且让用 message_id 去重而不是 event_id。
+   * 值是该 key 最近一次出现的时间戳——落盘到 `data/kb-admin-seen.json`，重启后仍生效
+   * （否则重启期间被重推的事件会二次执行）。
+   */
+  private readonly seen = new Map<string, number>();
+  private seenSaving: Promise<void> | null = null;
+  private seenDirty = false;
+  /** 卡片操作串行队列：读文件 → 改 → 写回是一段临界区，两个管理员同时点不能互相覆盖。 */
+  private readonly enqueue = createSerialQueue();
   /** 群里不支持话题回复时置位，避免每次都白试一遍、也只提醒一次。 */
   private threadsUnsupported = false;
   private stopped = false;
@@ -201,14 +216,15 @@ export class LarkKbAdmin {
       log.info("kb-admin", `知识库管理员 ${this.acl.ids.size} 人，操作群 ${chatId}`);
     }
 
+    await this.loadSeen();
+
     if (this.cfg.KB_GIT_ENABLED) {
       log.info(
         "kb-admin",
-        `正式知识库（${this.cfg.KB_PATH}）改完会 git 提交：仓库 ${this.cfg.KB_GIT_REPO}` +
-          `${this.cfg.KB_GIT_PUSH ? `，并推送到 ${this.cfg.KB_GIT_REMOTE}` : "（未开启推送）"}`,
+        `正式知识库（${this.cfg.KB_PATH}）改完会写提交请求，由宿主脚本提交并推送（见 scripts/kb-commit.sh）`,
       );
     } else {
-      log.warn("kb-admin", "KB_GIT_ENABLED=false：正式知识库改动不会 git 提交");
+      log.warn("kb-admin", "KB_GIT_ENABLED=false：正式知识库改动不会请求 git 提交");
     }
 
     await this.logChatMode();
@@ -231,7 +247,7 @@ export class LarkKbAdmin {
     signal.addEventListener("abort", () => this.stop(), { once: true });
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
     try {
@@ -239,6 +255,7 @@ export class LarkKbAdmin {
     } catch {
       // 关闭失败没有补救手段，进程马上就退了。
     }
+    await this.flushSeen();
   }
 
   /**
@@ -315,45 +332,49 @@ export class LarkKbAdmin {
     if (!this.once(`card:${data.event_id ?? messageId}`)) return toast("info", "这次操作已经处理过了");
 
     const op = String(verified.payload["op"] ?? "");
-    try {
-      switch (op) {
-        case OP.add:
-          return await this.onAdd(messageId);
-        case OP.wizardNext:
-          return await this.onWizardNext(verified.payload, data.action?.form_value ?? {});
-        case OP.wizardBack:
-          return await this.onWizardBack(verified.payload, data.action?.form_value ?? {});
-        case OP.submit:
-          return await this.onSubmit(openId, verified.payload, data.action?.form_value ?? {}, messageId);
-        case OP.list:
-          return await this.onList(messageId);
-        case OP.toggle:
-          return await this.onToggle(messageId);
-        case OP.del:
-          return await this.onDelete(openId, verified.payload, messageId);
-        case OP.remove:
-          return await this.onRemove(openId, verified.payload, messageId);
-        case OP.baseMenu:
-          return await this.onBaseMenu(messageId);
-        case OP.baseList:
-          return await this.onBaseList(messageId);
-        case OP.baseAdd:
-          return await this.onBaseAdd(messageId);
-        case OP.baseBack:
-          return await this.onBaseBack(verified.payload, data.action?.form_value ?? {});
-        case OP.baseConfirm:
-          return await this.onBaseConfirm(openId, verified.payload, data.action?.form_value ?? {}, messageId);
-        case OP.baseRemove:
-          return await this.onBaseRemove(verified.payload, messageId);
-        case OP.baseRemoveConfirm:
-          return await this.onBaseRemoveConfirm(openId, verified.payload, data.action?.form_value ?? {}, messageId);
-        default:
-          return toast("warning", `未知操作：${op === "" ? "(空)" : op}`);
+    // 串行：每个操作都是「读文件 → 改 → 写回」，两个管理员同时点不能互相覆盖。
+    // 幂等判断（once）留在队列外：它是同步的，重复推送在入队前就被挡掉。
+    return await this.enqueue("kb-admin", async () => {
+      try {
+        switch (op) {
+          case OP.add:
+            return await this.onAdd(messageId);
+          case OP.wizardNext:
+            return await this.onWizardNext(verified.payload, data.action?.form_value ?? {});
+          case OP.wizardBack:
+            return await this.onWizardBack(verified.payload, data.action?.form_value ?? {});
+          case OP.submit:
+            return await this.onSubmit(openId, verified.payload, data.action?.form_value ?? {}, messageId);
+          case OP.list:
+            return await this.onList(messageId);
+          case OP.toggle:
+            return await this.onToggle(messageId);
+          case OP.del:
+            return await this.onDelete(openId, verified.payload, messageId);
+          case OP.remove:
+            return await this.onRemove(openId, verified.payload, messageId);
+          case OP.baseMenu:
+            return await this.onBaseMenu(messageId);
+          case OP.baseList:
+            return await this.onBaseList(messageId);
+          case OP.baseAdd:
+            return await this.onBaseAdd(messageId);
+          case OP.baseBack:
+            return await this.onBaseBack(verified.payload, data.action?.form_value ?? {});
+          case OP.baseConfirm:
+            return await this.onBaseConfirm(openId, verified.payload, data.action?.form_value ?? {}, messageId);
+          case OP.baseRemove:
+            return await this.onBaseRemove(verified.payload, messageId);
+          case OP.baseRemoveConfirm:
+            return await this.onBaseRemoveConfirm(openId, verified.payload, data.action?.form_value ?? {}, messageId);
+          default:
+            return toast("warning", `未知操作：${op === "" ? "(空)" : op}`);
+        }
+      } catch (err) {
+        log.error("kb-admin", `处理 ${op} 失败：${errorText(err)}`);
+        return toast("error", `处理失败：${errorText(err)}`);
       }
-    } catch (err) {
-      log.error("kb-admin", `处理 ${op} 失败：${errorText(err)}`);
-      return toast("error", `处理失败：${errorText(err)}`);
-    }
+    });
   }
 
   /** 新增条目：不碰菜单卡片，另发一张向导卡片（第一步）进话题。 */
@@ -370,7 +391,7 @@ export class LarkKbAdmin {
    * 这样用户已经敲进去的内容原样留在屏幕上，改完直接再点一次即可。
    */
   private async onWizardNext(payload: Record<string, unknown>, form: Record<string, unknown>): Promise<CallbackResponse> {
-    const draft = mergeDraft(draftFromValue(payload), form);
+    const draft = mergeDraft(draftFromValue(payload), form, STEP1_FIELDS);
     const problem = this.checkStep1(draft);
     if (problem !== "") return toast("error", problem);
     return cardOnly(buildStep2Card(draft, this.sign, layerFromValue(payload)));
@@ -383,7 +404,7 @@ export class LarkKbAdmin {
    * 于是回退后**再点「下一步」时那段内容还在**——第一/二步之间可以随便来回切。
    */
   private async onWizardBack(payload: Record<string, unknown>, form: Record<string, unknown>): Promise<CallbackResponse> {
-    const draft = mergeDraft(draftFromValue(payload), form);
+    const draft = mergeDraft(draftFromValue(payload), form, STEP2_FIELDS);
     return cardOnly(buildStep1Card(this.sign, draft, layerFromValue(payload)));
   }
 
@@ -498,8 +519,8 @@ export class LarkKbAdmin {
     messageId: string,
   ): Promise<CallbackResponse> {
     // 第一步的 id/标题/关键词/处理方式在按钮的签名值里，第二步的答案/转交说明刚随
-    // form_value 上来 —— 合并成完整草稿。
-    const draft = mergeDraft(draftFromValue(payload), form);
+    // form_value 上来 —— 合并成完整草稿。表单只能覆盖第二步那两个字段（白名单）。
+    const draft = mergeDraft(draftFromValue(payload), form, STEP2_FIELDS);
     const problem = this.checkStep1(draft);
     if (problem !== "") return toast("error", problem);
 
@@ -587,7 +608,7 @@ export class LarkKbAdmin {
 
   /** 确认页 → 上一步：回到第二步（答案 / 转交说明），而不是一路退回第一步。 */
   private async onBaseBack(payload: Record<string, unknown>, form: Record<string, unknown>): Promise<CallbackResponse> {
-    const draft = mergeDraft(draftFromValue(payload), form);
+    const draft = mergeDraft(draftFromValue(payload), form, STEP2_FIELDS);
     return cardOnly(buildStep2Card(draft, this.sign, "base"));
   }
 
@@ -602,7 +623,7 @@ export class LarkKbAdmin {
     form: Record<string, unknown>,
     messageId: string,
   ): Promise<CallbackResponse> {
-    const draft = mergeDraft(draftFromValue(payload), form);
+    const draft = mergeDraft(draftFromValue(payload), form, STEP2_FIELDS);
     const problem = this.checkStep1(draft);
     if (problem !== "") return toast("error", problem);
 
@@ -636,7 +657,7 @@ export class LarkKbAdmin {
       actor: openId,
       source_message: messageId,
       commit: commit.message,
-      git: !this.cfg.KB_GIT_ENABLED ? "disabled" : git.ok ? (git.pushed ? "ok+pushed" : "ok") : git.reason,
+      git: !this.cfg.KB_GIT_ENABLED ? "disabled" : git.ok ? (git.deferred ? "requested" : git.pushed ? "ok+pushed" : "ok") : git.reason,
     });
 
     log.info("kb-admin", `正式知识库新增：${made.entry.id}（${made.entry.title}），操作者 ${openId}`);
@@ -692,7 +713,7 @@ export class LarkKbAdmin {
       trash_id: trashId,
       source_message: messageId,
       commit: commit.message,
-      git: !this.cfg.KB_GIT_ENABLED ? "disabled" : git.ok ? (git.pushed ? "ok+pushed" : "ok") : git.reason,
+      git: !this.cfg.KB_GIT_ENABLED ? "disabled" : git.ok ? (git.deferred ? "requested" : git.pushed ? "ok+pushed" : "ok") : git.reason,
     });
     log.info(
       "kb-admin",
@@ -750,28 +771,26 @@ export class LarkKbAdmin {
     }
   }
 
-  /** 提交正式知识库。失败只记日志、返回原因，绝不抛错。 */
+  /**
+   * 请求提交正式知识库。
+   *
+   * 容器不跑 git：只把提交信息写成 `data/kb-commit-request.txt`，由宿主的 `scripts/kb-commit.sh`
+   * 提交并推送（宿主有部署 key，容器不挂 `.git`、也拿不到凭据）。失败只记日志、返回原因，绝不抛错。
+   */
   private async commitBase(message: string): Promise<GitCommitResult> {
     if (!this.cfg.KB_GIT_ENABLED) return { ok: true, pushed: false };
-    const result = await commitPaths({
-      repo: this.cfg.KB_GIT_REPO,
-      paths: [this.cfg.KB_PATH],
-      message,
-      authorName: this.cfg.KB_GIT_AUTHOR_NAME,
-      authorEmail: this.cfg.KB_GIT_AUTHOR_EMAIL,
-      push: this.cfg.KB_GIT_PUSH,
-      remote: this.cfg.KB_GIT_REMOTE,
-    });
+    const result = await requestCommit({ dataDir: this.cfg.DATA_DIR, message });
     if (result.ok) {
-      log.info("kb-admin", `正式知识库已提交：${message}${result.pushed ? "（已推送）" : ""}`);
+      log.info("kb-admin", `正式知识库已写入，等待宿主提交：${message}`);
     } else {
-      log.warn("kb-admin", `正式知识库 git 提交失败：${result.reason}`);
+      log.warn("kb-admin", `正式知识库提交请求写入失败：${result.reason}`);
     }
     return result;
   }
 
   private withGitNote(message: string, git: GitCommitResult): string {
-    return git.ok ? message : `${message}（git 提交失败：${git.reason}）`;
+    if (!git.ok) return `${message}（提交请求失败：${git.reason}）`;
+    return git.deferred ? `${message}（已写入，宿主稍后提交）` : message;
   }
 
   /**
@@ -919,17 +938,79 @@ export class LarkKbAdmin {
 
   /**
    * 幂等簿记。飞书可能重复推送同一条消息/回调，重复执行会变成「同一张表单提交两次」。
-   * 满了丢**最旧的**（重新 set 让它排到 Set 末尾，淘汰顺序才是真正的 LRU）。
+   * 记录时间戳并落盘：重启后 TTL 内的记录仍然有效（挡住重启期间的重放）。
+   * 满了丢**最旧的**（重新 set 让它排到 Map 末尾，淘汰顺序才是真正的 LRU）。
    */
   private once(key: string): boolean {
-    if (this.seen.has(key)) return false;
+    const now = Date.now();
+    const previous = this.seen.get(key);
+    if (previous !== undefined && now - previous < SEEN_TTL_MS) return false;
     this.seen.delete(key);
-    this.seen.add(key);
+    this.seen.set(key, now);
     while (this.seen.size > SEEN_CAP) {
-      const oldest = this.seen.values().next().value;
+      const oldest = this.seen.keys().next().value;
       if (oldest === undefined) break;
       this.seen.delete(oldest);
     }
+    this.scheduleSeenSave();
     return true;
+  }
+
+  private get seenFile(): string {
+    return join(this.cfg.DATA_DIR, "kb-admin-seen.json");
+  }
+
+  /** 载入幂等簿记（丢掉太旧的）。首次运行没有文件属正常，静默跳过。 */
+  private async loadSeen(): Promise<void> {
+    try {
+      const raw = JSON.parse(await readFile(this.seenFile, "utf8")) as Record<string, unknown>;
+      const now = Date.now();
+      for (const [key, at] of Object.entries(raw)) {
+        if (typeof at === "number" && now - at < SEEN_TTL_MS) this.seen.set(key, at);
+      }
+    } catch {
+      // 首次运行没有文件，正常。
+    }
+  }
+
+  /** 退出前把未落盘的幂等簿记写完。 */
+  async flushSeen(): Promise<void> {
+    if (this.seenSaving) await this.seenSaving;
+    if (!this.seenDirty) return;
+    try {
+      await this.writeSeen();
+    } catch (err) {
+      log.warn("kb-admin", `幂等簿记落盘失败：${errorText(err)}`);
+    }
+  }
+
+  /** 合并密集写入：同一时刻只有一次落盘在进行，期间的新记录合并到下一次。 */
+  private scheduleSeenSave(): void {
+    this.seenDirty = true;
+    if (this.seenSaving) return;
+    this.seenSaving = (async () => {
+      while (this.seenDirty) {
+        this.seenDirty = false;
+        await this.writeSeen();
+      }
+    })()
+      .catch((err: unknown) => {
+        log.warn("kb-admin", `幂等簿记落盘失败：${errorText(err)}`);
+      })
+      .finally(() => {
+        this.seenSaving = null;
+      });
+  }
+
+  private async writeSeen(): Promise<void> {
+    await mkdir(this.cfg.DATA_DIR, { recursive: true });
+    const now = Date.now();
+    const payload: Record<string, number> = {};
+    for (const [key, at] of this.seen) {
+      if (now - at < SEEN_TTL_MS) payload[key] = at;
+    }
+    const tmp = `${this.seenFile}.tmp`;
+    await writeFile(tmp, JSON.stringify(payload, null, 2), "utf8");
+    await rename(tmp, this.seenFile);
   }
 }

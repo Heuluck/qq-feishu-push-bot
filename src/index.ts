@@ -77,7 +77,7 @@ async function main(): Promise<void> {
 
   await bot.start(controller.signal);
   bot.stop();
-  admin.stop();
+  await admin.stop();
   maintenance.stop();
   await Promise.all([limits.flush(), history.flush()]);
   log.info("boot", "已退出");

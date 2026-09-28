@@ -111,6 +111,12 @@ export const EMPTY_DRAFT: WizardDraft = {
 
 const DRAFT_KEYS: (keyof WizardDraft)[] = ["id", "title", "keywords", "route", "answer", "forward_hint"];
 
+/** 第一步表单里真实存在的字段。 */
+export const STEP1_FIELDS = ["id", "title", "keywords", "route"] as const;
+/** 第二步（答案 / 转交说明）表单里真实存在的字段。 */
+export const STEP2_FIELDS = ["answer", "forward_hint"] as const;
+export type DraftField = keyof WizardDraft;
+
 /**
  * 把草稿塞进按钮的回传值，并签名。
  *
@@ -141,12 +147,19 @@ export function draftFromValue(payload: Record<string, unknown>): WizardDraft {
 /**
  * 把刚提交上来的表单值合并进草稿。
  *
- * 只有**表单里真实存在的字段**才覆盖：第一步的表单没有 answer/forward_hint，所以从第二步
- * 退回第一步时，用户刚敲的那段答案会跟在按钮的签名值里活下来，再点「下一步」又回到眼前。
+ * **只有 `allowed` 里列出的字段才被覆盖**：表单回传的 `form_value` 是不带签名的，
+ * 第二步的表单里根本没有 id/标题，若不做白名单，一张伪造（或改过）的卡片就能用 `form_value`
+ * 覆盖掉按钮签名值里的 id/标题。调用方按当前步骤传 `STEP1_FIELDS` / `STEP2_FIELDS`。
+ *
+ * 其余字段原样保留——这正是「在第二步退回第一步后，已敲好的答案还能带回来」的实现方式。
  */
-export function mergeDraft(draft: WizardDraft, form: Record<string, unknown>): WizardDraft {
+export function mergeDraft(
+  draft: WizardDraft,
+  form: Record<string, unknown>,
+  allowed: readonly DraftField[],
+): WizardDraft {
   const next: WizardDraft = { ...draft };
-  for (const key of DRAFT_KEYS) {
+  for (const key of allowed) {
     const value = form[key];
     if (typeof value === "string") next[key] = value;
   }

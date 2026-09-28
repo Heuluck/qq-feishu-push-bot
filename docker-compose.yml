@@ -16,15 +16,10 @@ services:
     mem_limit: 320m
     volumes:
       # kb/ 必须可写：飞书群里的管理菜单要往 kb/kb.feishu.yaml 追加补充知识，
-      # 「正式知识库」菜单还会直接改 kb/kb.yaml（二次确认 + 回收站 + git 兜底）。
+      # 「正式知识库」菜单还会直接改 kb/kb.yaml（二次确认 + 回收站）。
+      # git 提交不在这里做：容器只写 data/kb-commit-request.txt，由宿主脚本提交并推送。
       - ./kb:/app/kb
       - ./data:/app/data
-      # 只挂 .git：容器里跑 git commit 需要它，work-tree 就是 /app，
-      # kb/kb.yaml 正在其中，所以提交会落进宿主仓库。缺 .git 时提交失败、只记一条日志。
-      - ./.git:/app/.git
-    environment:
-      # 容器内仓库 work-tree（覆盖 .env 默认的「.」——那是给本机 npm run dev 用的）。
-      KB_GIT_REPO: /app
     logging:
       driver: json-file
       options:

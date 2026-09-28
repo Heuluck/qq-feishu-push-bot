@@ -8,11 +8,12 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import sharp from "sharp";
 import type { Config } from "./core/config.js";
+import { sanitizeLogText } from "./core/log.js";
 import { stripMentions, truncateText } from "./core/text.js";
 import { loadKnowledgeBase, compileKnowledgeBase } from "./kb/kb.js";
 import type { FeishuKbEntry, KbEntry } from "./kb/kb.js";
 import { BaseKbStore } from "./kb/base.js";
-import { commitPaths } from "./kb/git.js";
+import { commitPaths, requestCommit } from "./kb/git.js";
 import {
   FeishuKbStore,
   checkDeletable,
@@ -28,6 +29,8 @@ import {
   EMPTY_DRAFT,
   MAX_COMMIT_MSG_CHARS,
   OP,
+  STEP1_FIELDS,
+  STEP2_FIELDS,
   buildAddedCard,
   buildBaseAddConfirmCard,
   buildBaseAddedCard,
@@ -49,7 +52,7 @@ import type { Card, KbState, WizardDraft } from "./lark/kbCards.js";
 import { REPLY_HINT, buildMessages } from "./llm/messages.js";
 import { EXPOSED_TOOLS, FORWARD_FEEDBACK_TOOL, ForwardFeedbackArgs, SEND_FOLLOWUP_TOOL, SendFollowupArgs, createTurnTools } from "./llm/tools.js";
 import { extractTextToolCalls, runTextToolCalls } from "./llm/toolmarkup.js";
-import { buildFollowUpCard, buildRootCard } from "./lark/cards.js";
+import { buildFollowUpCard, buildRootCard, sanitizeLarkMd } from "./lark/cards.js";
 import { topicKey } from "./lark/forwarder.js";
 import { splitContextAttachments } from "./qq/context.js";
 import { clearPreparedImageCache, isAllowedImageUrl, prepareImages, prepareImageUrls, quotedImageUrls, resizeImageBuffer } from "./qq/media.js";
@@ -467,6 +470,29 @@ const followUpElements = (followUp["elements"] ?? []) as Record<string, unknown>
 check("补充卡片：标题带序号", JSON.stringify(followUp).includes("补充 #3"));
 check("补充卡片：同样是概要外露 + 一个折叠面板", followUpElements.length === 2);
 check("补充卡片：蓝色标题以区分", JSON.stringify(followUp).includes('"blue"'));
+
+// 卡片文本转义（F4）：模型产出的 summary/details 以 lark_md 渲染，不能让链接/@提及/代码块穿透。
+const escaped = sanitizeLarkMd("**现象**　请看 [点我](https://evil.example/x) <at id=all></at> `code`");
+check(
+  "卡片转义：链接被中和、@提及被去掉、加粗与正文保留",
+  !escaped.includes("https://evil.example") &&
+    !escaped.includes("<at") &&
+    escaped.includes("**现象**") &&
+    escaped.includes("点我") &&
+    escaped.includes("code"),
+  JSON.stringify(escaped),
+);
+check(
+  "卡片转义：转交卡片里不出现模型编造的可点击链接",
+  !JSON.stringify(buildRootCard({ ...sample, summary: "[点我](https://evil.example)", details: "看到 [这里](https://evil.example) 了" })).includes(
+    "https://evil.example",
+  ),
+);
+
+// 日志净化（Q6）：换行/ANSI 不能伪造额外的日志行或刷花终端。
+check("日志净化：换行被转义成字面量", sanitizeLogText("第一行\n第二行") === "第一行\\n第二行");
+check("日志净化：ANSI 转义被剥离", sanitizeLogText("\u001b[31m红\u001b[0m字") === "红字");
+check("日志净化：普通文本原样返回", sanitizeLogText("正常一条日志") === "正常一条日志");
 
 check("提示词：已无「主人」称呼", !kb.systemPrompt.includes("主人"));
 // 条目 id 不给模型：话题聚合没启用（工具参数里没有 topic，模型填不了），发出去只占 token。
@@ -1097,12 +1123,12 @@ check(
   quotedImageUrls([{ contentType: "image/jpeg", url: "https://example.com/c.jpg" }])[0] === "https://example.com/c.jpg",
 );
 
-// 12. 知识库路线：先回复再转交
+// 12. 知识库路线：手机号条目（现为「直接回复」；answer_and_forward 仍是合法路线，见编译用例）
 const kbText = kb.entries.map((e) => `${e.title}/${e.route}`).join(" | ");
 check(
-  "知识库：手机号条目已合并为「先回复再转交」",
+  "知识库：手机号条目仍是单独一条（id=reset-phone），route 合法",
   kb.entries.filter((e) => e.id.startsWith("reset-phone")).length === 1 &&
-    kb.entries.some((e) => e.route === "answer_and_forward"),
+    kb.entries.every((e) => ["answer", "forward", "answer_and_forward"].includes(e.route)),
   kbText.slice(0, 80),
 );
 check(
@@ -1429,19 +1455,30 @@ check(
   JSON.stringify(draftPayload) === JSON.stringify(carried),
   JSON.stringify(draftPayload),
 );
-const formSays = mergeDraft(carried, { answer: "用户后来改的", route: "answer" });
+const formSays = mergeDraft(carried, { answer: "用户后来改的", forward_hint: "补充的转交说明" }, STEP2_FIELDS);
 check(
-  "向导草稿：表单里有的字段以表单为准",
-  formSays.answer === "用户后来改的" && formSays.route === "answer",
+  "向导草稿：第二步表单能改答案/转交说明",
+  formSays.answer === "用户后来改的" && formSays.forward_hint === "补充的转交说明",
 );
 check(
   "向导草稿：表单里没有的字段原样保留（这正是「上一步」能带回内容的原因）",
-  formSays.id === "feishu-a" && formSays.title === "标题" && formSays.keywords === "甲,乙",
+  formSays.id === "feishu-a" && formSays.title === "标题" && formSays.keywords === "甲,乙" && formSays.route === "forward",
+);
+check(
+  "向导草稿：非白名单字段即使出现在表单里也被忽略（防伪造 form_value 覆盖签名值）",
+  mergeDraft(carried, { id: "hacked", route: "answer" }, STEP2_FIELDS).id === "feishu-a" &&
+    mergeDraft(carried, { id: "hacked", route: "answer" }, STEP2_FIELDS).route === "forward",
+);
+check(
+  "向导草稿：第一步表单只能改基本信息，改不动第二步的答案",
+  (() => {
+    const step1Says = mergeDraft(carried, { id: "新的", answer: "不该被改" }, STEP1_FIELDS);
+    return step1Says.id === "新的" && step1Says.answer === carried.answer;
+  })(),
 );
 check(
   "向导草稿：表单里的非字符串值不会被当成内容",
-  mergeDraft(carried, { answer: 42, id: null }).answer === carried.answer &&
-    mergeDraft(carried, { answer: 42, id: null }).id === carried.id,
+  mergeDraft(carried, { answer: 42 }, STEP2_FIELDS).answer === carried.answer,
 );
 check(
   "向导草稿：签名覆盖到全部六个字段（改任何一个都会验签失败）",
@@ -1769,6 +1806,17 @@ const gitOutside = await commitPaths({
   remote: "origin",
 });
 check("git：仓库外的路径被拒绝", !gitOutside.ok);
+
+// 23. 提交请求：容器不跑 git，只把提交信息留给宿主脚本（scripts/kb-commit.sh）
+const reqDir = join(baseRoot, "commit-request");
+const req = await requestCommit({ dataDir: reqDir, message: "chore(kb): 新增条目" });
+check(
+  "提交请求：写下单行请求文件并标记 deferred",
+  req.ok &&
+    req.deferred === true &&
+    readFileSync(join(reqDir, "kb-commit-request.txt"), "utf8").trim() === "chore(kb): 新增条目",
+  req.ok ? "" : req.reason,
+);
 rmSync(baseRoot, { recursive: true, force: true });
 
 console.log(failed === 0 ? "\n全部通过 ✅" : `\n有 ${failed} 项失败 ❌`);

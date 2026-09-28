@@ -6,6 +6,19 @@
  */
 import type { ForwardRequest } from "./forwarder.js";
 
+/**
+ * 中和模型产出文本里的 markdown 结构，避免它在内部反馈群里渲染出可点击链接、@ 提及、
+ * 代码块等——这些能让一条「转交卡片」看起来像官方公告，或把管理员引去钓鱼页。
+ * 保留 `**加粗**` 与换行：提示词要求模型用 `**现象**` 这类小标题分段。
+ */
+export function sanitizeLarkMd(text: string): string {
+  return text
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1") // [文字](链接) / ![图](链接) → 只留文字
+    .replace(/<\/?at\b[^>]*>/gi, "") // @ 提及标签
+    .replace(/^\s{0,3}(```|~~~).*$/gm, "") // 代码围栏行
+    .replace(/`([^`]*)`/g, "$1"); // 行内代码 → 纯文字
+}
+
 /** 折叠面板：详情、诊断信息默认收起，群里只看到一行问题。 */
 function collapsiblePanel(title: string, elements: Record<string, unknown>[]): Record<string, unknown> {
   return {
@@ -32,7 +45,7 @@ function shortSender(senderId: string): string {
 function detailPanel(req: ForwardRequest): Record<string, unknown> {
   const time = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
   return collapsiblePanel("详情", [
-    { tag: "div", text: { tag: "lark_md", content: req.details } },
+    { tag: "div", text: { tag: "lark_md", content: sanitizeLarkMd(req.details) } },
     { tag: "hr" },
     {
       tag: "div",
@@ -52,7 +65,7 @@ export function buildRootCard(req: ForwardRequest): Record<string, unknown> {
       title: { tag: "plain_text", content: "🔔 QQ 群问题转交" },
     },
     elements: [
-      { tag: "div", text: { tag: "lark_md", content: req.summary } },
+      { tag: "div", text: { tag: "lark_md", content: sanitizeLarkMd(req.summary) } },
       detailPanel(req),
     ],
   };
@@ -66,7 +79,7 @@ export function buildFollowUpCard(req: ForwardRequest, count: number): Record<st
       title: { tag: "plain_text", content: `🔁 补充 #${count}` },
     },
     elements: [
-      { tag: "div", text: { tag: "lark_md", content: req.summary } },
+      { tag: "div", text: { tag: "lark_md", content: sanitizeLarkMd(req.summary) } },
       detailPanel(req),
     ],
   };

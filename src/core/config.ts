@@ -153,27 +153,16 @@ const EnvSchema = z.object({
 
   // 正式知识库（kb.yaml）的 git 留痕
   /**
-   * 卡片改动 kb.yaml 后是否自动 git commit。
+   * 卡片改动 kb.yaml 后是否写一份提交请求（`data/kb-commit-request.txt`）。
    *
-   * 需要容器能访问一个 git 仓库（compose 把仓库根挂到 /repo，并把 KB_GIT_REPO 指过去）
-   * 且镜像里有 git。仓库缺失时提交失败只记日志、不影响改动本身（文件已写盘并热重载）。
+   * 容器本身**不跑 git**：请求由宿主的 `scripts/kb-commit.sh` 落成提交并推送（宿主有部署 key，
+   * 容器不挂 `.git`、也不需要 git 二进制）。关掉后正式知识库改动不会留 git 记录，
+   * 文件本身仍会写盘并热重载。提交者身份、远端等由宿主脚本自己的环境决定。
    */
   KB_GIT_ENABLED: z
     .enum(["true", "false"])
     .default("true")
     .transform((value) => value === "true"),
-  /** 仓库根目录；git 命令在这里执行（容器内默认挂在 /repo，本机开发是当前目录）。 */
-  KB_GIT_REPO: z.string().trim().min(1).default("."),
-  /** 提交后是否推送。预留能力：默认关闭，配好远端与凭据再打开。 */
-  KB_GIT_PUSH: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((value) => value === "true"),
-  /** push 用的远端名。 */
-  KB_GIT_REMOTE: z.string().trim().min(1).default("origin"),
-  /** 提交者身份。容器里通常没有全局 git 配置，所以每条命令显式带上。 */
-  KB_GIT_AUTHOR_NAME: z.string().trim().min(1).default("kb-bot"),
-  KB_GIT_AUTHOR_EMAIL: z.string().trim().min(1).default("kb-bot@localhost"),
 
   DATA_DIR: z.string().trim().min(1).default("data"),
   /** 数据文件（转交留档/调试转储/配额归档）的保留天数。 */
