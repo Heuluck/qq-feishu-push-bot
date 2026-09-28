@@ -25,7 +25,7 @@ variables:
 entries:
   - id: greeting
     title: 打招呼 / 使用引导
-    keywords: [你好, 在吗, 怎么用, 帮助]
+    keywords: [ 你好, 在吗, 怎么用, 帮助 ]
     route: answer
     answer: |
       你好，我是homebot。直接@我发问题给我就行；
@@ -33,7 +33,7 @@ entries:
 
   - id: reset-phone
     title: 修改手机号
-    keywords: [手机号, 新手机, 手机卡丢了, 登录不上, 无法登录]
+    keywords: [ 手机号, 新手机, 手机卡丢了, 登录不上, 无法登录 ]
     route: answer
     answer: |
       如果已经登录南大家园，打开南大家园-生活-云家园-右上角账号设置-密保手机，自己就能改；
@@ -41,84 +41,84 @@ entries:
 
   - id: reset-password
     title: 重置密码
-    keywords: [密码]
+    keywords: [ 密码 ]
     route: answer
     answer: |
       原手机号还能用的话，退出登录-云家园登录-忘记密码
 
   - id: no-schedule
     title: 没有课表 / 不显示课表
-    keywords: [没课表, 不显示]
+    keywords: [ 没课表, 不显示 ]
     route: answer
     answer: |
       请尝试连接校园网、他人热点（移动卡可能会有连接问题）；或打开教务系统（{{jwpt}}）-「学期理论课表」查看本学期是否有课。如果教务系统中也查不到本学期课表，请联系教务处 {{jwpt-phone}}；如果教务系统有课、只有南大家园不显示，请直接反馈给我们。
 
   - id: wrong-schedule
     title: 课表有误 / 选课完课表不同步
-    keywords: [课表, 课程, 缺课, 少课, 不一致, 不一样, 选课, 退课]
+    keywords: [ 课表, 课程, 缺课, 少课, 不一致, 不一样, 选课, 退课 ]
     route: answer
     answer: |
       课表每日同步，刚选退课需要等待明天同步，请以教务系统为准。可对比教务系统（{{jwpt}}）-「学期理论课表」查看是否确有此课；如果教务系统中的课程信息有误，请联系教务处 {{jwpt-phone}}，如果只有南大家园未同步，请直接反馈给我们。
 
   - id: schedule-adjustment
     title: 调休 / 补课安排
-    keywords: [调休, 补课, 调课]
+    keywords: [ 调休, 补课, 调课 ]
     route: answer
     answer: |
       南大家园目前没有自动调休功能，课表不会根据调休自动改动。具体上课安排请以教务处通知和教务系统为准。
 
   - id: major-change-not-sync
     title: 转专业后资料未同步
-    keywords: [转专业]
+    keywords: [ 转专业 ]
     route: forward
     forward_hint: |
       请稍后联系负责的同学，提供原学院和班级、现学院和班级、学号、现辅导员名字
 
   - id: wrong-credit
     title: 绩点对不上教务系统
-    keywords: [绩点]
+    keywords: [ 绩点 ]
     route: answer
     answer: |
       请以教务系统（{{jwpt}}）绩点为准。
 
   - id: no-credit
     title: 绩点不显示
-    keywords: [绩点]
+    keywords: [ 绩点 ]
     route: answer
     answer: |
       请在教务系统（{{jwpt}}）查询绩点。
 
   - id: download
     title: 下载南大家园
-    keywords: [下载]
+    keywords: [ 下载 ]
     route: answer
     answer: |
       请在 {{app-download}} 下载最新版南大家园（当前版本 {{latest-version}}），{{app-package-hint}}
 
   - id: update
     title: 无法更新南大家园
-    keywords: [更新]
+    keywords: [ 更新 ]
     route: answer
     answer: |
       请在 {{app-download}} 下载最新版南大家园（当前版本 {{latest-version}}），{{app-package-hint}}，最新版已经解决无法应用内更新的问题。
 
   - id: wrong-timeline
     title: 上课时间不对
-    keywords: [下载, 更新]
+    keywords: [ 下载, 更新 ]
     route: answer
     answer: |
       根据教务处2026秋季学期上课时间变动，我们已更新南大家园时间表，请在 {{app-download}} 更新最新版南大家园（{{latest-version}}），{{app-package-hint}}
 
   - id: master-student
     title: 研究生能否使用南大家园
-    keywords: [硕士, 博士, 研究生]
+    keywords: [ 硕士, 博士, 研究生 ]
     route: answer
     answer: |
       十分抱歉，由于缺少数据，南大家园暂不支持研究生使用
 
   - id: ncu-center
     title: 融合门户 / 企业微信 / 邮箱 / 校园网 相关问题
-    keywords: [融合门户, 企业微信, 邮箱, 校园网]
+    keywords: [ 融合门户, 企业微信, 邮箱, 校园网 ]
     route: answer
     answer: |
       请联系南昌大学网络与信息中心。
@@ -127,49 +127,42 @@ entries:
 
   - id: mystery-store
     title: 神秘商店是什么
-    keywords: [神秘商店]
+    keywords: [ 神秘商店 ]
     route: answer
     answer: |
       可以用兑换码兑换神秘物品的地方——可以关注一下我们的后续活动
 
   - id: electric-app-missing
     title: 电费查询应用不见了
-    keywords: [电费]
+    keywords: [ 电费 ]
     route: answer
     answer: |
       根据学校要求，南大家园电费查询已下架。请前往企业微信一码通查询和缴费
 
   - id: electric
     title: 电费对不上 / 交了钱没电
-    keywords: [电费, 电]
+    keywords: [ 电费, 电 ]
     route: answer
     answer: |
       请联系学校水电中心售电咨询服务电话 0791-83969182 或 15797965280 (金老师)
 
   - id: electric-service-tele
     title: 水电服务电话
-    keywords: [水,电]
+    keywords: [ 水, 电 ]
     route: answer
     answer: |
       水电服务：0791-83969768；学生售电咨询服务：0791-83969182 或 15797965280
-  
+
   - id: select-course-on-incu
     title: 南大家园的选课是真的吗
-    keywords: [选课, 自定义课程]
+    keywords: [ 选课, 自定义课程 ]
     route: answer
     answer: |
       不是的，选课必须上教务系统，南大家园只是提供了一个自定义课程的功能，方便同学们蹭课。具体选课时间请以教务处通知为准。
 
-  - id: why-xiaohongshu
-    title: 为什么会打开小红书
-    keywords: [跳转, 小红书]
-    route: answer
-    answer: |
-      这可能是第三方 SDK 调用的，我们并没有使用这些功能，将在未来修复，直接全部拒绝掉就行。
-
   - id: bug-report
     title: 功能异常 / 崩溃 / 报错
-    keywords: [报错, 崩溃, 闪退, 用不了, bug, 卡住]
+    keywords: [ 报错, 崩溃, 闪退, 用不了, bug, 卡住 ]
     route: forward
     forward_hint: |
       推荐用户下载最新版。需要用户提供：App 版本、手机型号与系统版本、出问题的操作步骤、报错截图。
