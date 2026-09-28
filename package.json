@@ -8,9 +8,11 @@
     "node": ">=24"
   },
   "scripts": {
-    "dev": "op run --env-file .env -- tsx watch src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "dev:op": "op run --env-file .env -- tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "op run --env-file .env -- node dist/index.js",
+    "start": "node dist/index.js",
+    "start:op": "op run --env-file .env -- node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "smoke": "tsx src/smoke.ts"
   },
