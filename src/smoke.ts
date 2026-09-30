@@ -1627,6 +1627,36 @@ check(
   !(await store.load()).file.entries.some((item) => item.id === "s2"),
 );
 
+// 回收站被写坏（手工改坏、写了一半）时，下一次删除**不能**把整份归档冲掉：
+// 原档改名留底到 data/，新档从零开始。
+const corruptRoot = join("data/smoke-tmp", "trash-corrupt");
+rmSync(corruptRoot, { recursive: true, force: true });
+mkdirSync(join(corruptRoot, "kb"), { recursive: true });
+const corruptTrash = join(corruptRoot, "kb", "kb.feishu.trash.yaml");
+writeFileSync(corruptTrash, "deleted: [ 坏掉的归档\n", "utf8");
+const corruptStore = new FeishuKbStore({
+  layer: join(corruptRoot, "kb", "kb.feishu.yaml"),
+  trash: corruptTrash,
+  dataDir: join(corruptRoot, "data"),
+});
+const corruptNewId = await corruptStore.trash(
+  { id: "s7", title: "标题-s7", keywords: ["k"], route: "answer", answer: "a" },
+  "ou_admin",
+);
+const backups = readdirSync(join(corruptRoot, "data")).filter((name) => name.includes(".corrupt-"));
+check(
+  "回收站：写坏时原档留底到 data/（kb/ 里不留诊断文件）",
+  backups.length === 1 && readdirSync(join(corruptRoot, "kb")).every((name) => !name.includes(".corrupt-")),
+  backups.join(","),
+);
+check(
+  "回收站：原档内容仍在留底文件里，新档只含本次一条",
+  readFileSync(join(corruptRoot, "data", backups[0]!), "utf8").includes("坏掉的归档") &&
+    readFileSync(corruptTrash, "utf8").includes(corruptNewId) &&
+    parseTrashFileText(readFileSync(corruptTrash, "utf8")).length === 1,
+);
+rmSync(corruptRoot, { recursive: true, force: true });
+
 // 19. 管理员名单（含 * 通配）
 const aclWildcard = parseAdminIds("*", "oc_group");
 check("名单：* 且配了群 → 群内任何人可操作", aclWildcard.wildcard && aclWildcard.problem === "");
