@@ -461,10 +461,10 @@ export class LarkKbAdmin {
     // 新发一张结果卡片（用户要求的「操作结果回卡片」），同时把那张「已新增」卡片原地
     // 换成「已删除」——按钮随之消失，点不动第二次。
     void this.refreshMenu();
-    void this.replyCard(
+    this.fireAndForgetCard(
       messageId,
       buildResultCard(true, `已删除：${entry.title}`, [`**原 id**　\`${entry.id}\``, `**回收站 id**　\`${trashId}\``]),
-      { inThread: true },
+      "结果",
     );
     return toastWithCard("success", `已删除「${entry.title}」`, buildDeletedCard(entry));
   }
@@ -502,10 +502,10 @@ export class LarkKbAdmin {
     // 原地把那张列表卡刷新一遍（被删的那行消失），另外新发一张结果卡片。
     // 结果卡片不是多余的：回收站里的新 id 得让人看得见，否则事后没法在 yaml 里对上。
     void this.refreshMenu();
-    void this.replyCard(
+    this.fireAndForgetCard(
       messageId,
       buildResultCard(true, `已删除：${entry.title}`, [`**原 id**　\`${entry.id}\``, `**回收站 id**　\`${trashId}\``]),
-      { inThread: true },
+      "结果",
     );
     const { file: after } = await this.store.load();
     return toastWithCard("success", `已删除「${entry.title}」`, buildEntryListCard(this.state(), after.entries, this.sign));
@@ -581,7 +581,7 @@ export class LarkKbAdmin {
     // 结果卡片新发到话题里（删除按钮就挂在那张卡上），同时把表单卡片原地换成「已提交」，
     // 免得有人对着同一张表单再点一次提交。
     void this.refreshMenu();
-    void this.replyCard(messageId, buildAddedCard(entry, this.sign), { inThread: true });
+    this.fireAndForgetCard(messageId, buildAddedCard(entry, this.sign), "已新增");
     return toastWithCard("success", `已新增「${entry.title}」`, buildSubmittedCard(entry));
   }
 
@@ -884,6 +884,19 @@ export class LarkKbAdmin {
       this.menuPatchable = false;
       log.debug("kb-admin", `主菜单刷新异常：${errorText(err)}`);
     }
+  }
+
+  /**
+   * 发一张「发出去就不管」的结果卡片。
+   *
+   * 必须在这里把失败吃掉：这类 Promise 没人 await，一旦被拒绝，Node 默认会结束整个进程
+   * （飞书一次 429/5xx 就能让 QQ 机器人跟着重启）。卡片发不出去只影响这次操作的观感，
+   * 主流程（写盘、热重载、审计）早就完成了。
+   */
+  private fireAndForgetCard(messageId: string, card: Card, what: string): void {
+    void this.replyCard(messageId, card, { inThread: true }).catch((err: unknown) => {
+      log.warn("kb-admin", `${what}卡片发送失败：${errorText(err)}`);
+    });
   }
 
   /** 回复某条消息并附一张卡片。`inThread` 为真时收进那条消息的话题。 */

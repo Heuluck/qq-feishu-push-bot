@@ -16,6 +16,12 @@ async function main(): Promise<void> {
   const cfg = loadConfig();
   setLogLevel(cfg.LOG_LEVEL);
 
+  // 兜底：任何「发出去就不管」的 Promise 被拒绝时只记日志。Node 默认会因此结束进程，
+  // 而一次飞书 429、一次落盘失败都不该把 QQ 机器人一起带走。
+  process.on("unhandledRejection", (reason) => {
+    log.error("boot", `未处理的 Promise 拒绝（已忽略，不退出）：${reason instanceof Error ? reason.message : String(reason)}`);
+  });
+
   // 知识库：基线（kb.yaml，人工维护）+ 飞书补充层（kb.feishu.yaml，群里菜单写）。持有在运行时里，
   // 飞书那边改完就地热重载，不必重启容器，更不必重新 deploy。
   const kb = new KnowledgeBaseRuntime(cfg);
