@@ -71,6 +71,8 @@ src/
     limits.ts       频次、每日配额、读图额度
     retention.ts    数据文件命名、保留策略、旧格式迁移
     debugDump.ts    调试用的原始事件转储
+scripts/
+  kb-commit.sh      宿主侧：把容器的提交请求落成一次 git 提交并推送（见「正式知识库（kb.yaml）」）
 ```
 
 ## 快速开始
@@ -104,11 +106,17 @@ docker compose logs -f      # 看日志
 docker compose restart      # 改完 kb/kb.yaml 后重启生效
 ```
 
-`docker-compose.yml` 里没有 `ports:`，只走出站连接；内存上限 320MB。
+`docker-compose.yml` 里没有 `ports:`，只走出站连接；内存上限 512MB，并关掉了全部 capability
+与提权（`cap_drop: ALL` + `no-new-privileges`）。
 `kb/` 是**可写**挂载——飞书群里的管理菜单要往 `kb/kb.feishu.yaml` 追加补充知识。
 `kb/kb.yaml`（正式知识库）也能在群里改，但走的是主菜单里那个**红色危险入口**：
-每步二次确认 + 填提交说明，删掉的进 `kb/kb.trash.yaml`，改完在服务器仓库里 `git commit`。
-容器因此把**宿主的 `.git` 挂到了 `/app/.git`**、镜像里也装了 `git`；服务器上这个目录需要是一个 git 仓库。
+每步二次确认 + 填提交说明，删掉的进 `kb/kb.trash.yaml`。
+
+**容器里不跑 git**：改完只往 `data/kb-commit-request.txt` 写一行提交说明，由宿主的
+`scripts/kb-commit.sh`（cron / systemd timer 触发）在仓库里 `git add` + `commit` + `push`。
+容器因此不挂 `.git`、不需要 git 二进制、也拿不到推送凭据——**这是刻意的**：
+容器可写 `.git` 就等于能用 `hooks` / `core.sshCommand` 在宿主上执行代码，所以**绝不要把宿主的
+`.git` 挂进容器**。脚本的安装与 `KB_*` 变量见下文「正式知识库（kb.yaml）：红色危险入口」。
 
 如果本机是 arm64 而服务器是 x86_64（或者服务器内存很小、不适合跑 `npm ci` + `tsc`），用 `deploy.sh`：它在本机交叉编译出目标架构的镜像、连代码一起推上去，服务器只负责 `docker load` 和 `up`，全程不构建。整个流程只开两条 SSH 连接（每条都要按一次硬件密钥的指纹，所以刻意压到最少）。
 
@@ -131,9 +139,9 @@ docker compose restart      # 改完 kb/kb.yaml 后重启生效
 > 两个例外都有独立开关：`--pull` 把它**拉回来**（云上那份才是最新的），`--feishu` 显式把它**推上去**
 > （推送前会把线上原有那份备份进 `data/kb-feishu-snapshots/`，和程序自己留的快照同一套命名与保留策略）。
 >
-> `kb/kb.yaml` 与 `kb/kb.trash.yaml` 同理**永远不推**：正式知识库由「正式知识库」菜单在服务器上直接改
-> 并由 `git` 留痕，属于运行期数据。服务器上的仓库需要先 `git clone`（或 `git init` + 配远端）好，
-> 容器才能提交（`.git` 已挂进容器）；要把它同步回本机就 `./deploy.sh --pull` 或直接 `git pull`。
+> `kb/kb.yaml` 与 `kb/kb.trash.yaml` 同理**永远不推**：正式知识库由「正式知识库」菜单在服务器上直接改，
+> 由宿主的 `scripts/kb-commit.sh` 在仓库里提交、推送，属于运行期数据。要把它同步回本机就
+> `./deploy.sh --pull` 或直接 `git pull`。
 
 它不会在服务器上执行 `docker compose build`，所以那台机器多小都能跑；但这也意味着改了 `src/` 之后必须在**本机**重新部署，服务器上那份源码只是留档。
 
@@ -339,12 +347,23 @@ entries:
 - **二次确认是硬性的**：新增在第二步「提交」之后**先出一张确认页**，把完整条目回显出来，
   再要求填写**提交说明**；删除点下去**不会直接删**，而是发一张确认卡。两张确认卡上的
   「确认写入 / 确认删除」都是**表单提交按钮**，提交说明（空的不放行）随 `form_value` 上来。
-- **每次都 git 提交**：提交信息由服务端拼成 `chore(kb): <你填的说明>`。容器里跑
-  `git -C /app commit -- kb/kb.yaml`（宿主的 `.git` 已挂到 `/app/.git`，work-tree 就是 `/app`），
-  只提交这一个文件；`KB_GIT_ENABLED=false` 可关掉，
-  `KB_GIT_PUSH=true`（默认 false）会在提交后再 `git push`——远端与凭据要先配好。
-  **提交失败不回滚**：文件已经写盘并生效，卡片会带一句「（git 提交失败：…）」，
-  日志与审计里也记着原因，事后手工补一次提交即可。
+- **每次都留 git 记录**：提交信息由服务端拼成 `chore(kb): <你填的说明>`，写进
+  `data/kb-commit-request.txt`；**容器不跑 git**，由宿主的 `scripts/kb-commit.sh` 在仓库里
+  `git add -- kb/kb.yaml` + `commit` + `push`。宿主侧要装一次定时器（cron 或 systemd timer 都行，
+  一分钟一次足够）：
+
+  ```bash
+  # crontab -e（跑在拥有部署 key 的那台机器 / 那个账号上）
+  * * * * * /path/to/repo/scripts/kb-commit.sh >> /var/log/kb-commit.log 2>&1
+  ```
+
+  脚本读这些环境变量（都有默认值）：`KB_REPO`（仓库根）、`KB_FILE`（默认 `kb/kb.yaml`）、
+  `KB_GIT_REMOTE`（默认 `origin`）、`KB_GIT_PUSH`（**默认 true**，设 false 只提交不推送）、
+  `KB_GIT_AUTHOR_NAME` / `KB_GIT_AUTHOR_EMAIL`。它只提交请求里约定的那一个文件、只接受
+  `chore(kb): ` 前缀的单行说明，并且拒绝软链等非普通文件（容器对 `data/` 有写权限，
+  宿主这一侧必须自己防）。`KB_GIT_ENABLED=false` 则连请求文件都不写。
+  **提交失败不回滚**：文件已经写盘并生效，卡片会带一句提示，日志与审计里也记着原因，
+  事后手工补一次提交即可。
 - **改文档而不是重新渲染**：kb.yaml 里的人工注释、变量表都靠 `yaml` 的 `parseDocument` 原样保留，
   卡片只会往 `entries` 里增删一个节点，不会把整份文件重排。
 - **删除进回收站**：`kb/kb.trash.yaml`（`KB_TRASH_PATH`），记录里的 id 是 `原 id + 短 uuid`。
@@ -558,6 +577,8 @@ entries:
 **没有「已答复就不再喂」这类闸门**。图留在自己那一轮，模型能看到历史里的所有图，这是正确行为；要不要参考由模型按时间和上下文判断（系统规则里明确写了「别把几十分钟前的截图当成刚刚发生的新故障」）。我们曾经加过一道「图答复过就不重复注入」的闸门，那是错的：它既让模型在后续追问里看不见图（只能请用户重发，多一整轮交互），又让缓存从改动点失效。
 
 **同一个 URL 只处理一次，处理结果在进程内缓存**（`src/qq/media.ts`，最多 60 张 / 24MB）。历史里的图每轮都要重新交给模型，没有这层缓存就会每轮重新下载 + 缩放。
+
+**下载与解码都有硬上限**：地址必须是 `qq.com` / `qq.com.cn` 的 HTTPS（每一跳重定向都重新校验），字节数上限 `IMG_MAX_BYTES`（默认 10MB），**解码像素上限** `IMG_MAX_PIXELS`（默认 6400 万，交给 libvips 的 `limitInputPixels`）。最后这条是防解压炸弹的：一张 10MB 以内的 PNG 能解到上亿像素、吃掉几百 MB 内存，把容器直接 OOM 掉；超限的图只会被判为「这张图没读到」，不影响其它消息。
 
 **带图的轮次后面跟一个图注**，形如 `[16:06] 用户Heuluck: 怎么崩了啊 ［图：16:06］`。这是 Anthropic vision 文档在多轮场景下的要求：给每张图一个短标签，后续轮次才能按名字引用它。实测没有图注时问「第 1 张、第 2 张分别是什么颜色」会答错甚至数错张数；有了图注，模型能准确列出「16:04 一张、16:06 一张，还有 16:08 那张群聊截图」。用**该轮的时间**而不是「第 N 张」做标签——序号会随窗口滑动而变，时间不会。
 
