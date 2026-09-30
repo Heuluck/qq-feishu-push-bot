@@ -52,11 +52,30 @@ function reasonOf(err: unknown): string {
 }
 
 /**
+ * push 的远端名只允许普通名字。以 `-` 开头的会被 git 当成选项，例如
+ * `git push --upload-pack=<命令> HEAD` 会让 git 去执行那个命令——`execFile` 无 shell
+ * 挡不住这种**参数**注入。合法远端名（origin / upstream / 路径形式）都在这个字符集里。
+ */
+const SAFE_REMOTE = /^[A-Za-z0-9._/-]+$/;
+
+/**
  * 把若干路径提交进仓库。只提交列出的路径：`git commit -- <paths>` 是路径限定提交，
  * 不会顺手把别人留在索引里的改动一起带走（这正是服务器上仓库用途单一、但有历史残留时的保险）。
  */
 export async function commitPaths(opts: GitCommitOptions): Promise<GitCommitResult> {
   const repo = resolve(opts.repo);
+
+  if (!SAFE_REMOTE.test(opts.remote)) {
+    return { ok: false, reason: `远端名不合法：${opts.remote}` };
+  }
+  // `-c user.name=<值>` 的值里一旦有换行，等于往 git 配置里多塞一行（core.sshCommand 之类）。
+  for (const [label, value] of [
+    ["authorName", opts.authorName],
+    ["authorEmail", opts.authorEmail],
+  ] as const) {
+    if (value === "" || /[\r\n\0]/.test(value)) return { ok: false, reason: `${label} 不合法` };
+  }
+
   const rels: string[] = [];
   for (const path of opts.paths) {
     const rel = relative(repo, resolve(path));

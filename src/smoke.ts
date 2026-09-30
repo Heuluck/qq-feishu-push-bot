@@ -1806,6 +1806,26 @@ const gitOutside = await commitPaths({
   remote: "origin",
 });
 check("git：仓库外的路径被拒绝", !gitOutside.ok);
+const gitBadRemote = await commitPaths({
+  repo: gitRoot,
+  paths: [join(gitRoot, "kb.yaml")],
+  message: "chore(kb): x",
+  authorName: "kb-bot",
+  authorEmail: "kb-bot@localhost",
+  push: false,
+  remote: "--upload-pack=/bin/sh",
+});
+check("git：以 - 开头的远端名被拒绝（参数注入）", !gitBadRemote.ok);
+const gitBadAuthor = await commitPaths({
+  repo: gitRoot,
+  paths: [join(gitRoot, "kb.yaml")],
+  message: "chore(kb): x",
+  authorName: "kb-bot\n[core]\n\tsshCommand = sh -c 'id'",
+  authorEmail: "kb-bot@localhost",
+  push: false,
+  remote: "origin",
+});
+check("git：提交者身份里带换行被拒绝", !gitBadAuthor.ok);
 
 // 23. 提交请求：容器不跑 git，只把提交信息留给宿主脚本（scripts/kb-commit.sh）
 const reqDir = join(baseRoot, "commit-request");
