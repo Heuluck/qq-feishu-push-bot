@@ -10,3 +10,10 @@ data
 .git
 .DS_Store
 *.log
+
+# kb/ 里由飞书菜单写出来的运行期状态（含回收站）：属于每台服务器各自的数据，
+# 只在 compose 的 bind mount 里出现，不该被烤进镜像层、更不该随镜像 tar 传到服务器。
+kb/kb.feishu.yaml
+kb/kb.feishu.trash.yaml
+kb/kb.trash.yaml
+kb/*.tmp
