@@ -96,7 +96,10 @@ export function extractTextToolCalls(text: string): ParsedTextToolCalls {
 
   // 3) 散文形态：调用 <name> / 调用工具 <name> / invoke name="<name>"
   if (calls.length === 0) {
-    const named = /(?:调用工具|调用|工具|invoke|tool)\s*[:：,，]?\s*"?([A-Za-z_][\w-]*)"?/i.exec(text);
+    // 空白与可选分隔符写成一个字符类。原来写成 `\s*[:：,，]?\s*`，失败时要把两者的组合
+    // 逐个回溯一遍：模型（或被注入的回复）吐一串空格就退化成 O(N²)——实测 128KB 要 9.6 秒，
+    // 而这段解析跑在事件循环上，会卡住整个进程。
+    const named = /(?:调用工具|调用|工具|invoke|tool)[\s:：,，]*"?([A-Za-z_][\w-]*)"?/i.exec(text);
     if (named?.[1]) {
       const rest = text.slice(named.index + named[0].length);
       const args = jsonCall(rest);
@@ -109,7 +112,7 @@ export function extractTextToolCalls(text: string): ParsedTextToolCalls {
   cleaned = cleaned.replace(INTERNAL_MARKER, "");
   if (calls.length > 0) {
     // 散文形态：把「调用 xxx …」那一行也去掉，避免残留
-    cleaned = cleaned.replace(/(?:调用工具|调用|工具|invoke|tool)\s*[:：,，]?\s*"?[A-Za-z_][\w-]*"?[^\n]*/i, "");
+    cleaned = cleaned.replace(/(?:调用工具|调用|工具|invoke|tool)[\s:：,，]*"?[A-Za-z_][\w-]*"?[^\n]*/i, "");
   }
 
   return { cleaned: cleaned.trim(), calls, unparsedMarkup: calls.length === 0 && DSML_MARK.test(text) };

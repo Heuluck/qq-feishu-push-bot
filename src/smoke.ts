@@ -1083,6 +1083,14 @@ const runResult = await runTextToolCalls(leaked, async (name, argsJson) => {
 check("工具标记：调用被真的执行", executed.length === 1 && runResult.forwarded, executed.join(","));
 check("工具标记：无标记时不误判", extractTextToolCalls("课表不显示可以先连校园网。").calls.length === 0);
 check("工具标记：内部标记【必须告知】也会被清掉", !extractTextToolCalls("【必须告知】今天图片额度用完了。").cleaned.includes("【必须告知】"));
+// 散文形态的分隔符曾经写成 `\s*[:：,，]?\s*`，一串空格就能让回溯退化成 O(N²)：
+// 256KB 在那个写法下要几十秒，而这段解析在事件循环上跑。这里用宽松上限守住回归
+// （修好后是几毫秒，只有真的退化了才会超）。
+const redoStext = `工具${" ".repeat(256 * 1024)}!`;
+const redoStart = Date.now();
+extractTextToolCalls(redoStext);
+const redoMs = Date.now() - redoStart;
+check("工具标记：空白很多时不会退化成 O(N²)", redoMs < 1_000, `256KB 空白耗时 ${redoMs}ms`);
 // 单引号属性：模型换了写法也不能变成「标记被删掉、调用没执行」。
 const singleQuoted = `<||DSML||calls><||DSML||invoke name='forward_feedback'><||DSML||parameter name='summary'>用户甲要求转人工</||DSML||parameter></||DSML||invoke></||DSML||calls>`;
 check(
