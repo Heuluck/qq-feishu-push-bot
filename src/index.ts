@@ -50,7 +50,16 @@ async function main(): Promise<void> {
   }
 
   const forwarder = new FeedbackForwarder(cfg);
-  await forwarder.init();
+  try {
+    await forwarder.init();
+  } catch (err) {
+    // 飞书侧起不来不该拖着 QQ 机器人一起起不来：能答的知识库问题照常答，只有「需要转交」
+    // 会退化成一句通道未就绪的提示；知识库管理也因为拿不到群而自动跳过（见 LarkKbAdmin.start）。
+    log.error(
+      "lark",
+      `飞书初始化失败，本次运行转交通道与知识库管理不可用：${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 
   const limits = new Limits(cfg);
   await limits.init();
