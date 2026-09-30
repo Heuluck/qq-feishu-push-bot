@@ -294,6 +294,18 @@ check(
   smallOut.mime === "image/png" && Buffer.compare(smallOut.data, small) === 0,
   `mime=${smallOut.mime}，字节与原图一致`,
 );
+
+// 解压炸弹：像素总数超过 IMG_MAX_PIXELS 的图必须被拒绝（调用方会跳过这一张，而不是把容器 OOM 掉）
+const bomb = await sharp({ create: { width: 2000, height: 2000, channels: 3, background: "#fff" } })
+  .png()
+  .toBuffer();
+let bombRejected = false;
+try {
+  await resizeImageBuffer(bomb, { ...cfg, IMG_MAX_PIXELS: 1_000_000 } as unknown as Config);
+} catch {
+  bombRejected = true;
+}
+check("解压炸弹：超过像素上限的图被拒绝", bombRejected, `2000x2000 对上限 100 万像素，${bomb.byteLength} 字节`);
 check("超限 PNG 会重编码为 JPEG", bigOut.mime === "image/jpeg");
 check("图片地址：允许 QQ HTTPS 子域名", isAllowedImageUrl("https://multimedia.nt.qq.com.cn/download?fileid=x"));
 check("图片地址：拒绝非 HTTPS 或伪造域名", !isAllowedImageUrl("http://multimedia.nt.qq.com.cn/x") && !isAllowedImageUrl("https://qq.com.evil.example/x"));

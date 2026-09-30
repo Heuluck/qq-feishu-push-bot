@@ -149,14 +149,25 @@ export interface PreparedBuffer {
   mime: "image/png" | "image/jpeg";
 }
 
+/**
+ * 交给 libvips 的解码上限。
+ *
+ * 只按文件字节数拦不住解压炸弹：一张 10MB 以内的 PNG 能解到上亿像素（几百 MB 内存），
+ * 容器会被直接 OOM 掉。这里按 `IMG_MAX_PIXELS` 限制总像素，超限的图由 sharp 抛错、
+ * 走「图片处理失败已跳过」那条路，只丢掉这张图。
+ */
+function decodeOptions(cfg: Config): { limitInputPixels: number } {
+  return { limitInputPixels: cfg.IMG_MAX_PIXELS };
+}
+
 export async function resizeImageBuffer(raw: Buffer, cfg: Config): Promise<PreparedBuffer> {
-  const meta = await sharp(raw).metadata();
+  const meta = await sharp(raw, decodeOptions(cfg)).metadata();
   const longEdge = Math.max(meta.width ?? 0, meta.height ?? 0);
   if (meta.format === "png" && longEdge > 0 && longEdge <= cfg.IMG_MAX_EDGE) {
     return { data: raw, mime: "image/png" };
   }
 
-  const data = await sharp(raw)
+  const data = await sharp(raw, decodeOptions(cfg))
     .rotate()
     .resize({ width: cfg.IMG_MAX_EDGE, height: cfg.IMG_MAX_EDGE, fit: "inside", withoutEnlargement: true })
     .jpeg({ quality: 90 })
@@ -229,7 +240,7 @@ export async function prepareImageUrls(
     try {
       const raw = await fetchBytes(key, cfg.IMG_MAX_BYTES);
       const prepared = await resizeImageBuffer(raw, cfg);
-      const meta = await sharp(prepared.data).metadata();
+      const meta = await sharp(prepared.data, decodeOptions(cfg)).metadata();
       const image = {
         dataUrl: `data:${prepared.mime};base64,${prepared.data.toString("base64")}`,
         width: meta.width,

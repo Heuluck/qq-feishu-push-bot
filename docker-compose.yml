@@ -13,7 +13,8 @@ services:
     # 服务器上填 `id -u` / `id -g` 的结果。别填成宿主机上另一个真实用户的 uid。
     user: "${BOT_UID:-1000}:${BOT_GID:-1000}"
     # 无 ports：机器人只走出站连接，不需要暴露任何端口
-    mem_limit: 320m
+    # 内存上限留出解码余量：IMG_MAX_PIXELS 默认 6400 万像素，一张大图解码峰值约 200MB。
+    mem_limit: 512m
     volumes:
       # kb/ 必须可写：飞书群里的管理菜单要往 kb/kb.feishu.yaml 追加补充知识，
       # 「正式知识库」菜单还会直接改 kb/kb.yaml（二次确认 + 回收站）。

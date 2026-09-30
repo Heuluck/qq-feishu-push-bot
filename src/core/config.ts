@@ -55,6 +55,15 @@ const EnvSchema = z.object({
   IMG_MAX_COUNT: z.coerce.number().int().min(0).max(4).default(2),
   IMG_MAX_BYTES: z.coerce.number().int().min(1024).default(10 * 1024 * 1024),
   /**
+   * 解码总像素上限，交给 libvips（sharp 的 `limitInputPixels`）。
+   *
+   * 光看文件大小挡不住解压炸弹：一张 10MB 以内的 PNG 可以解到上亿像素、占几百 MB 内存，
+   * 把容器直接 OOM 掉。超限的图会被判为「处理失败」跳过（用户看到的是图片没读到），
+   * 不会拖垮整个进程。默认 6400 万像素——覆盖 8000×6000 这类手机原图，又留足余量；
+   * sharp 自己的上限是 268402689。
+   */
+  IMG_MAX_PIXELS: z.coerce.number().int().min(1_000_000).max(268_402_689).default(64_000_000),
+  /**
    * 上下文（对话缓冲）里最多为该用户挑几张图。
    * 与 IMG_MAX_COUNT（单条消息自带的图）分开算：用户常常连发几张截图、中间还夹着别人的消息，
    * 因此按「该用户最近的图」去找，而不是按「最近 N 条消息」去找。
