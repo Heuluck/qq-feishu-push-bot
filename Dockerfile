@@ -1,7 +1,11 @@
 FROM node:24-slim@sha256:2fe369e969550cde8e867afc3fe370b260140cab4a23d467074295b42163d553 AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci
+# --ignore-scripts：安装脚本是在构建期以 root 跑的，而这个项目没有任何依赖需要它——
+# sharp 0.35 没有 install/postinstall（预编译包走 optionalDependencies），esbuild 只是 dev
+# 依赖（运行时镜像里会被 prune 掉），protobufjs 的 postinstall 只打印版本提示。
+# 要新增需要安装脚本的依赖时，在这里显式补一步，而不是放开全部。
+RUN npm ci --ignore-scripts
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build && npm prune --omit=dev
