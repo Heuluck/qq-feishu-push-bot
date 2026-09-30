@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { isMap, isSeq, parseDocument, stringify as stringifyYaml } from "yaml";
 import { log } from "../core/log.js";
 import { monthKey, stampKey } from "../store/retention.js";
-import { atomicWrite, parseTrashFileText, renderTrashFileText, trashIdOf } from "./feishu.js";
+import { atomicWrite, loadTrashForAppend, renderTrashFileText, trashIdOf } from "./feishu.js";
 import { versionOf } from "./kb.js";
 import type { KbEntry } from "./kb.js";
 
@@ -131,8 +131,11 @@ export class BaseKbStore {
       for (const name of names.slice(0, Math.max(0, names.length - KEEP_SNAPSHOTS))) {
         await unlink(join(this.snapshotDir, name));
       }
-    } catch {
-      // 目录还不存在，忽略。
+    } catch (err) {
+      // 目录还不存在属于正常；其它错误必须留痕，否则一次权限错误就让快照无限攒下去。
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        log.warn("kb-admin", `正式知识库快照裁剪失败：${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 
@@ -141,12 +144,8 @@ export class BaseKbStore {
    * **先写回收站、再改主文件**：反过来的话，中间挂掉就会丢掉这条内容。
    */
   async trash(entry: KbEntry, actor: string): Promise<string> {
-    let records: Record<string, unknown>[] = [];
-    try {
-      records = parseTrashFileText(await readFile(this.paths.trash, "utf8"));
-    } catch {
-      records = [];
-    }
+    // 损坏的归档不会被覆盖：函数内部会把原档改名留底（见 loadTrashForAppend）。
+    const records = await loadTrashForAppend(this.paths.trash, this.paths.dataDir);
     const id = trashIdOf(entry.id);
     records.push({
       id,

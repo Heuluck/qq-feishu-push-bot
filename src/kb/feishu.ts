@@ -9,7 +9,7 @@
  */
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { z } from "zod";
 import { log } from "../core/log.js";
@@ -60,17 +60,66 @@ export function renderTrashFileText(records: Record<string, unknown>[], header: 
  * 把整个管理菜单带崩；程序本来也不消费它的内容。
  */
 export function parseTrashFileText(raw: string): Record<string, unknown>[] {
+  const parsed = tryParseTrashFileText(raw);
+  return parsed.ok ? parsed.records : [];
+}
+
+/**
+ * 严格版解析：区分「解析成功但一条都没有」和「根本没解析出来」。
+ *
+ * 写入路径必须区分这两者——宽松版把损坏也当成空表，`trash()` 接着整份重写，
+ * 于是一次格式损坏就把回收站里累积的归档全部冲掉。
+ */
+export function tryParseTrashFileText(
+  raw: string,
+): { ok: true; records: Record<string, unknown>[] } | { ok: false } {
   let doc: unknown;
   try {
     doc = parseYaml(raw);
   } catch {
-    // 手工改坏了 YAML 也不该抛：这里只是归档，没人靠它跑业务。
+    // 手工改坏了 YAML 也不该抛：交给调用方决定怎么处理。
+    return { ok: false };
+  }
+  if (typeof doc !== "object" || doc === null) return { ok: false };
+  const list = (doc as Record<string, unknown>)["deleted"];
+  if (!Array.isArray(list)) return { ok: false };
+  return {
+    ok: true,
+    records: list.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null),
+  };
+}
+
+/**
+ * 读取回收站、准备往里追加。损坏时**不覆盖**：把原档改名留底（`*.corrupt-<时间戳>`）
+ * 再从空档继续。宁可少一条归档，也不能因为一次格式损坏丢掉整份。
+ *
+ * 留底写到 `backupDir`（data/）而不是 kb/ 里：kb/ 是随仓库走、会被 deploy 上传的目录，
+ * 不该出现这种一次性的诊断文件。
+ *
+ * 留底都失败时抛错：调用方会中止这次删除（宁可删不掉，也不能把归档冲掉）。
+ */
+export async function loadTrashForAppend(path: string, backupDir?: string): Promise<Record<string, unknown>[]> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    // 还没有回收站文件，属于正常情况。
     return [];
   }
-  if (typeof doc !== "object" || doc === null) return [];
-  const list = (doc as Record<string, unknown>)["deleted"];
-  if (!Array.isArray(list)) return [];
-  return list.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null);
+  const parsed = tryParseTrashFileText(raw);
+  if (parsed.ok) return parsed.records;
+
+  const dir = backupDir ?? dirname(path);
+  const archived = join(dir, `${basename(path)}.corrupt-${stampKey()}`);
+  try {
+    await mkdir(dir, { recursive: true });
+    await rename(path, archived);
+  } catch (err) {
+    log.warn("kb-admin", `回收站解析失败且留底失败：${err instanceof Error ? err.message : String(err)}`);
+    throw err;
+  }
+  log.warn("kb-admin", `回收站解析失败，原档已留底为 ${archived}，本次从空档继续写入`);
+  return [];
 }
 
 export interface FeishuLayerFile {
@@ -295,8 +344,12 @@ export class FeishuKbStore {
       for (const name of names.slice(0, Math.max(0, names.length - KEEP_SNAPSHOTS))) {
         await unlink(join(this.snapshotDir, name));
       }
-    } catch {
-      // 目录还不存在，忽略。
+    } catch (err) {
+      // 目录还不存在属于正常（第一次写入之前没有快照）；其它错误必须留痕：
+      // 原来一律吞掉，一次权限错误就会让快照无限攒下去、没人知道。
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        log.warn("kb-admin", `快照裁剪失败：${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 
@@ -317,13 +370,8 @@ export class FeishuKbStore {
    * 写回收站失败会直接把错误抛给调用方，宁可不删也不能删丢了。
    */
   async trash(entry: FeishuKbEntry, actor: string): Promise<string> {
-    let records: Record<string, unknown>[] = [];
-    try {
-      records = parseTrashFileText(await readFile(this.trashPath, "utf8"));
-    } catch {
-      // 还没有回收站文件，属于正常情况。
-      records = [];
-    }
+    // 损坏的归档不会被覆盖：函数内部会把原档改名留底（见 loadTrashForAppend）。
+    const records = await loadTrashForAppend(this.trashPath, this.dataDir);
     const id = trashIdOf(entry.id);
     records.push({
       id,
