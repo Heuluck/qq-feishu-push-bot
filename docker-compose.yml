@@ -15,6 +15,15 @@ services:
     # 无 ports：机器人只走出站连接，不需要暴露任何端口
     # 内存上限留出解码余量：IMG_MAX_PIXELS 默认 6400 万像素，一张大图解码峰值约 200MB。
     mem_limit: 512m
+    # 这个进程只需要跑 node，不需要任何 capability；再关掉 setuid/setgid 提权，
+    # 万一图片解码（libvips 是原生代码）被攻破，也只能停在容器内的普通用户上。
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # 进程数上限挡 fork 炸弹；CPU 上限挡一张大图解码把宿主机抢满（机器人本身是 IO 密集）。
+    pids_limit: 256
+    cpus: 2
     volumes:
       # kb/ 必须可写：飞书群里的管理菜单要往 kb/kb.feishu.yaml 追加补充知识，
       # 「正式知识库」菜单还会直接改 kb/kb.yaml（二次确认 + 回收站）。
