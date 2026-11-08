@@ -12,7 +12,7 @@
 
 variables:
   # 当前发布版本。必须加引号：不加引号的 5.0 之类会被 YAML 当成数字，小数位会丢掉
-  latest-version: "5.16.0"
+  latest-version: "5.17.0"
 
   # 应用下载站（官网）+ 群文件兜底
   app-download: https://incu.ncu.edu.cn/
